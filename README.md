@@ -1,6 +1,8 @@
 # shtop — Shell Top for Linux
 NOTE: This is the Linux twin of [ptop](https://github.com/stavrostzagadouris/powershellTop), which Gemini Argon made for me. Claude ported it to Linux. Feel free to use it if you want.
 
+> 🪟 **On Windows?** Check out **[ptop](https://github.com/stavrostzagadouris/powershellTop)**, the original Windows version. It has the same look, themes and keys, in a single PowerShell script that needs no admin.
+
 A fast, flicker-free, **zero-root** `btop`-style Terminal UI (TUI) system and GPU monitor for Linux, written as a single standalone Python 3 script with **no dependencies** beyond the standard library.
 
 It has the same layout, themes and keys as `ptop`. Under the hood it reads `/proc` and `/sys` directly, so no daemons, kernel modules or `sudo` are needed.
