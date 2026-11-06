@@ -1,0 +1,1282 @@
+#!/usr/bin/env python3
+"""
+shtop - Shell Top: zero-root system & GPU monitor for Linux.
+
+The Linux twin of ptop (PowerShell Top): same layout, themes and controls.
+A single file, Python 3 standard library only, no root required. Reads /proc
+and /sys directly; NVIDIA telemetry comes from nvidia-smi when present, AMD
+from amdgpu sysfs, and per-process GPU activity for AMD/Intel from DRM fdinfo.
+
+Controls:
+  [Q] / [Esc] : Quit (Esc clears an active filter first; Ctrl+C also quits)
+  [/]         : Filter processes by name or PID (Enter keeps, Esc clears)
+  [Up]/[Down] : Select process in table
+  [K] / [Del] : Send SIGTERM to selected process (press again within 3s: SIGKILL)
+  [P]         : Toggle Per-Core CPU bars view
+  [T]         : Cycle color themes (Midnight, Cyberpunk, Matrix, Gruvbox, Nord)
+  [C]         : Sort processes by CPU%
+  [M]         : Sort processes by Memory
+  [G]         : Prioritize GPU processes
+  [+] / [-]   : Increase / Decrease refresh speed
+"""
+
+import argparse
+import glob
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import termios
+import time
+import traceback
+import tty
+from datetime import datetime
+
+ESC = "\x1b"
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+KB = 1024
+MB = KB * 1024
+GB = MB * 1024
+
+
+# ── Themes (24-bit TrueColor, identical to ptop) ─────────────────────────────
+
+def _fg(rgb, bold=False):
+    return f"{ESC}[{'1;' if bold else ''}38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+
+
+def _bg(rgb):
+    return f"{ESC}[48;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+
+
+class Theme:
+    def __init__(self, name, border, title, subtitle, text, dim, green, cyan, yellow,
+                 orange, red, magenta, hdr_bg, hdr_fg, sel_bg, sel_fg, gputag):
+        self.Name = name
+        self.Border = _fg(border)
+        self.Title = _fg(title, True)
+        self.SubTitle = _fg(subtitle)
+        self.Text = _fg(text)
+        self.Dim = _fg(dim)
+        self.Green = _fg(green)
+        self.Cyan = _fg(cyan)
+        self.Yellow = _fg(yellow)
+        self.Orange = _fg(orange)
+        self.Red = _fg(red)
+        self.Magenta = _fg(magenta)
+        self.HeaderBg = _bg(hdr_bg) + _fg(hdr_fg, True)
+        self.SelBg = _bg(sel_bg) + _fg(sel_fg, True)
+        self.GpuTag = _fg(gputag, True)
+        self.Reset = f"{ESC}[0m"
+
+
+THEMES = [
+    Theme("Midnight", (90, 105, 135), (220, 230, 255), (140, 160, 200), (210, 220, 235),
+          (115, 125, 150), (100, 230, 145), (90, 215, 255), (255, 210, 90), (255, 145, 75),
+          (255, 85, 100), (205, 130, 255), (35, 45, 68), (190, 215, 255), (55, 75, 115),
+          (255, 255, 255), (118, 255, 3)),
+    Theme("Cyberpunk", (255, 0, 128), (0, 255, 255), (255, 105, 180), (240, 240, 255),
+          (140, 90, 160), (0, 255, 180), (0, 240, 255), (255, 240, 0), (255, 120, 0),
+          (255, 40, 80), (255, 0, 255), (75, 15, 65), (0, 255, 255), (130, 20, 105),
+          (255, 255, 0), (0, 255, 160)),
+    Theme("Matrix", (30, 140, 50), (120, 255, 140), (70, 200, 90), (160, 245, 170),
+          (55, 115, 65), (50, 255, 90), (110, 255, 160), (190, 255, 90), (240, 200, 60),
+          (255, 90, 90), (100, 235, 180), (15, 55, 25), (130, 255, 150), (30, 95, 45),
+          (220, 255, 220), (180, 255, 60)),
+    Theme("Gruvbox", (146, 131, 116), (251, 241, 199), (213, 196, 161), (235, 219, 178),
+          (124, 111, 100), (184, 187, 38), (142, 192, 124), (250, 189, 47), (254, 128, 25),
+          (251, 73, 52), (211, 134, 155), (60, 56, 54), (250, 189, 47), (102, 92, 84),
+          (251, 241, 199), (184, 187, 38)),
+    Theme("Nord", (94, 129, 172), (236, 239, 244), (136, 192, 208), (216, 222, 233),
+          (108, 122, 148), (163, 190, 140), (136, 192, 208), (235, 203, 139), (208, 135, 112),
+          (191, 97, 106), (180, 142, 173), (59, 66, 82), (136, 192, 208), (76, 86, 106),
+          (236, 239, 244), (163, 190, 140)),
+]
+
+
+# ── Small helpers ────────────────────────────────────────────────────────────
+
+def read_text(path, default=None):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except (OSError, ValueError):
+        return default
+
+
+def read_int(path, default=None):
+    try:
+        return int(read_text(path))
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp(v, lo=0.0, hi=100.0):
+    return max(lo, min(hi, v))
+
+
+def visible_len(s):
+    return len(ANSI_RE.sub("", s))
+
+
+def to_float(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+# ── CPU ──────────────────────────────────────────────────────────────────────
+
+class CpuSampler:
+    """Overall and per-core utilisation from /proc/stat deltas."""
+
+    def __init__(self):
+        self.prev = self._read()
+
+    @staticmethod
+    def _read():
+        out = {}
+        with open("/proc/stat") as f:
+            for line in f:
+                if not line.startswith("cpu"):
+                    break
+                parts = line.split()
+                vals = [int(x) for x in parts[1:9]]
+                vals += [0] * (8 - len(vals))
+                # idle + iowait count as idle; guest time is already inside user
+                out[parts[0]] = (vals[3] + vals[4], sum(vals))
+        return out
+
+    def sample(self):
+        cur = self._read()
+
+        def pct(key):
+            if key not in self.prev:
+                return 0.0
+            d_idle = cur[key][0] - self.prev[key][0]
+            d_total = cur[key][1] - self.prev[key][1]
+            return clamp((d_total - d_idle) / d_total * 100.0) if d_total > 0 else 0.0
+
+        total = pct("cpu")
+        cores = sorted((k for k in cur if k != "cpu"), key=lambda k: int(k[3:]))
+        per_core = [(int(k[3:]), pct(k)) for k in cores]
+        self.prev = cur
+        return total, per_core
+
+
+def get_cpu_name():
+    try:
+        with open("/proc/cpuinfo") as f:
+            fallback = None
+            for line in f:
+                key, _, val = line.partition(":")
+                key, val = key.strip(), " ".join(val.split())
+                if not val:
+                    continue
+                if key == "model name":
+                    return val
+                if key in ("Model", "Hardware", "cpu model") and not fallback:
+                    fallback = val
+            if fallback:
+                return fallback
+    except OSError:
+        pass
+    return os.uname().machine or "CPU"
+
+
+def get_meminfo():
+    m = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            key, _, val = line.partition(":")
+            parts = val.split()
+            if parts:
+                m[key] = int(parts[0]) * KB
+    if "MemAvailable" not in m:
+        m["MemAvailable"] = m.get("MemFree", 0) + m.get("Buffers", 0) + m.get("Cached", 0)
+    return m
+
+
+# ── GPU ──────────────────────────────────────────────────────────────────────
+
+PCI_IDS_PATHS = ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids", "/usr/share/pci.ids")
+VENDOR_NAMES = {"0x1002": "AMD", "0x8086": "Intel", "0x10de": "NVIDIA"}
+
+
+def pci_device_name(vendor, device):
+    v = vendor.lower().replace("0x", "")
+    d = device.lower().replace("0x", "")
+    for path in PCI_IDS_PATHS:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                in_vendor = False
+                for line in f:
+                    if not line.strip() or line[0] == "#":
+                        continue
+                    if line[0] != "\t":
+                        if in_vendor:
+                            return None
+                        in_vendor = line.startswith(v + "  ")
+                    elif in_vendor and line[1] != "\t" and line[1:].startswith(d + "  "):
+                        return line[1:].split("  ", 1)[1].strip()
+        except OSError:
+            continue
+    return None
+
+
+def short_gpu_name(name):
+    m = re.search(r"(RX|RTX|GTX|Arc)\s+\S+", name)
+    if m:
+        return m.group(0)
+    s = re.sub(r"^(AMD|Intel|NVIDIA)\s+", "", name)
+    s = re.sub(r"\s+Graphics", "", s).strip()
+    return s or "GPU"
+
+
+def new_gpu_stats(name="No GPU detected"):
+    return {
+        "Name": name, "ShortName": short_gpu_name(name), "Util": 0.0, "MemUtil": None,
+        "MemUsedMB": 0.0, "MemTotMB": None, "Temp": None, "PowerW": None, "PowerCapW": None,
+        "FanPct": None, "ClockCore": None, "ClockMem": None, "PState": "", "GpuPids": {},
+    }
+
+
+class NvidiaGpu:
+    QUERY = ("name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,"
+             "power.draw,power.limit,fan.speed,clocks.current.graphics,clocks.current.memory,pstate")
+
+    def __init__(self, smi):
+        self.smi = smi
+
+    def _run(self, *args):
+        try:
+            r = subprocess.run([self.smi, *args], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, universal_newlines=True, timeout=5)
+            return r.stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    def sample(self, _pids):
+        res = new_gpu_stats("NVIDIA GPU")
+        out = self._run(f"--query-gpu={self.QUERY}", "--format=csv,noheader,nounits")
+        lines = out.splitlines()
+        parts = [p.strip() for p in lines[0].split(",")] if lines else []
+        if len(parts) >= 12:
+            res["Name"] = parts[0]
+            res["ShortName"] = short_gpu_name(parts[0])
+            res["Util"] = to_float(parts[1]) or 0.0
+            res["MemUtil"] = to_float(parts[2])
+            res["MemUsedMB"] = to_float(parts[3]) or 0.0
+            res["MemTotMB"] = max(1.0, to_float(parts[4]) or 1.0)
+            res["Temp"] = to_float(parts[5])
+            res["PowerW"] = to_float(parts[6])
+            res["PowerCapW"] = to_float(parts[7])
+            res["FanPct"] = to_float(parts[8])
+            core, mem = to_float(parts[9]), to_float(parts[10])
+            res["ClockCore"] = int(core) if core else None
+            res["ClockMem"] = int(mem) if mem else None
+            res["PState"] = parts[11]
+
+        for pl in self._run("pmon", "-c", "1").splitlines():
+            m = re.match(r"^\s*\d+\s+(\d+)\s+(\S+)\s+(\S+)", pl)
+            if m:
+                res["GpuPids"][int(m.group(1))] = int(m.group(3)) if m.group(3).isdigit() else 0
+        return res
+
+
+class DrmClients:
+    """Per-process GPU engine usage from /proc/<pid>/fdinfo (DRM client stats).
+
+    Works for amdgpu, i915, xe and other DRM drivers that publish drm-engine-*
+    keys. Only processes you own are readable without root, which is fine: that
+    is everything you are running on your desktop.
+    """
+    RESCAN_SEC = 5.0
+
+    def __init__(self, pdev):
+        self.pdev = pdev
+        self.fds = {}
+        self.last_scan = 0.0
+        self.prev = {}
+        self.prev_t = None
+
+    @staticmethod
+    def _scan_fds(pid):
+        base = f"/proc/{pid}/fd"
+        found = []
+        try:
+            names = os.listdir(base)
+        except OSError:
+            return found
+        for fd in names:
+            try:
+                if os.readlink(f"{base}/{fd}").startswith("/dev/dri/"):
+                    found.append(fd)
+            except OSError:
+                pass
+        return found
+
+    def _read_fdinfo(self, pid, fd):
+        try:
+            with open(f"/proc/{pid}/fdinfo/{fd}") as f:
+                text = f.read()
+        except OSError:
+            return None
+        if "drm-client-id" not in text:
+            return None
+        cid = pdev = None
+        ns, cap, cycles, total = {}, {}, {}, {}
+        for line in text.splitlines():
+            key, _, val = line.partition(":")
+            val = val.strip()
+            try:
+                if key == "drm-client-id":
+                    cid = val
+                elif key == "drm-pdev":
+                    pdev = val
+                elif key.startswith("drm-engine-capacity-"):
+                    cap[key[20:]] = int(val.split()[0])
+                elif key.startswith("drm-engine-"):
+                    ns[key[11:]] = int(val.split()[0])
+                elif key.startswith("drm-total-cycles-"):
+                    total[key[17:]] = int(val.split()[0])
+                elif key.startswith("drm-cycles-"):
+                    cycles[key[11:]] = int(val.split()[0])
+            except (ValueError, IndexError):
+                continue
+        if cid is None or (pdev and self.pdev and pdev != self.pdev):
+            return None
+        engines = {e: (b, None, max(1, cap.get(e, 1))) for e, b in ns.items()}
+        for e, b in cycles.items():          # xe reports cycles instead of ns
+            if e in total:
+                engines[e] = (b, total[e], 1)
+        return cid, engines
+
+    def sample(self, pids):
+        now = time.monotonic()
+        full = now - self.last_scan >= self.RESCAN_SEC
+        if full:
+            self.last_scan = now
+        fds = {}
+        for pid in pids:
+            fds[pid] = self._scan_fds(pid) if (full or pid not in self.fds) else self.fds[pid]
+        self.fds = fds
+
+        cur = {}
+        for pid, fd_list in fds.items():
+            for fd in fd_list:
+                info = self._read_fdinfo(pid, fd)
+                if info and info[0] not in cur:
+                    cur[info[0]] = (pid, info[1])
+
+        dt_ns = (now - self.prev_t) * 1e9 if self.prev_t else None
+        pid_eng, all_eng = {}, {}
+        for cid, (pid, engines) in cur.items():
+            pe = pid_eng.setdefault(pid, {})
+            old = self.prev.get(cid)
+            if not old or old[0] != pid or not dt_ns:
+                continue
+            for e, (busy, tot, cp) in engines.items():
+                o = old[1].get(e)
+                if not o:
+                    continue
+                if tot is None:
+                    frac = (busy - o[0]) / (dt_ns * cp)
+                else:
+                    d_tot = tot - o[1]
+                    frac = (busy - o[0]) / d_tot if d_tot > 0 else 0.0
+                if frac > 0:
+                    pe[e] = pe.get(e, 0.0) + frac
+                    all_eng[e] = all_eng.get(e, 0.0) + frac
+        self.prev, self.prev_t = cur, now
+
+        pid_util = {pid: int(round(min(100.0, max(e.values(), default=0.0) * 100.0)))
+                    for pid, e in pid_eng.items()}
+        # Like Task Manager / ptop: adapter util = busiest engine type
+        adapter = min(100.0, max(all_eng.values(), default=0.0) * 100.0)
+        return pid_util, adapter
+
+
+class DrmGpu:
+    """AMD / Intel / other DRM GPUs via sysfs (no root)."""
+
+    def __init__(self, card):
+        self.card = card
+        self.dev = card + "/device"
+        self.vendor = read_text(self.dev + "/vendor", "")
+        self.pdev = os.path.basename(os.path.realpath(self.dev))
+        hw = sorted(glob.glob(self.dev + "/hwmon/hwmon*"))
+        self.hwmon = hw[0] if hw else None
+        self.clients = DrmClients(self.pdev)
+
+        vend = VENDOR_NAMES.get(self.vendor, "")
+        raw = read_text(self.dev + "/product_name") or \
+            pci_device_name(self.vendor, read_text(self.dev + "/device", ""))
+        if raw:
+            m = re.search(r"\[([^\]]+)\]", raw)
+            nice = m.group(1) if m else raw
+            self.name = nice if not vend or nice.startswith(vend) else f"{vend} {nice}"
+        else:
+            self.name = f"{vend or 'Unknown'} GPU"
+
+        self.freq_paths = [p for p in (
+            glob.glob(card + "/gt_act_freq_mhz") +
+            glob.glob(card + "/gt/gt0/rps_act_freq_mhz") +
+            glob.glob(self.dev + "/tile0/gt0/freq0/act_freq")) if os.path.exists(p)]
+
+    @staticmethod
+    def find():
+        best, best_score = None, None
+        for card in glob.glob("/sys/class/drm/card*"):
+            if not re.fullmatch(r"card\d+", os.path.basename(card)):
+                continue
+            dev = card + "/device"
+            vendor = read_text(dev + "/vendor")
+            if not vendor:
+                continue
+            vram = read_int(dev + "/mem_info_vram_total", 0)
+            # Prefer a discrete AMD card (most VRAM), then Intel, then anything
+            score = (vendor == "0x1002", vram, vendor == "0x8086")
+            if best_score is None or score > best_score:
+                best, best_score = card, score
+        return DrmGpu(best) if best else None
+
+    def _hw(self, name):
+        return read_int(f"{self.hwmon}/{name}") if self.hwmon else None
+
+    def _dpm_current(self, fname):
+        txt = read_text(f"{self.dev}/{fname}")
+        for line in (txt or "").splitlines():
+            if line.rstrip().endswith("*"):
+                m = re.search(r"(\d+)\s*Mhz", line, re.I)
+                if m:
+                    return int(m.group(1))
+        return None
+
+    def sample(self, pids):
+        res = new_gpu_stats(self.name)
+        pid_util, engine_util = self.clients.sample(pids)
+        res["GpuPids"] = pid_util
+
+        busy = read_int(self.dev + "/gpu_busy_percent")
+        res["Util"] = float(busy) if busy is not None else engine_util
+        res["MemUtil"] = read_int(self.dev + "/mem_busy_percent")
+
+        vtot = read_int(self.dev + "/mem_info_vram_total")
+        if vtot:
+            res["MemTotMB"] = vtot / MB
+            res["MemUsedMB"] = (read_int(self.dev + "/mem_info_vram_used") or 0) / MB
+
+        t = self._hw("temp1_input")
+        res["Temp"] = t / 1000.0 if t is not None else None
+        p = self._hw("power1_average")
+        if p is None:
+            p = self._hw("power1_input")
+        res["PowerW"] = p / 1e6 if p is not None else None
+        cap = self._hw("power1_cap")
+        res["PowerCapW"] = cap / 1e6 if cap else None
+        pwm = self._hw("pwm1")
+        if pwm is not None:
+            res["FanPct"] = pwm / (self._hw("pwm1_max") or 255) * 100.0
+
+        sclk, mclk = self._hw("freq1_input"), self._hw("freq2_input")
+        res["ClockCore"] = sclk // 1000000 if sclk else self._dpm_current("pp_dpm_sclk")
+        res["ClockMem"] = mclk // 1000000 if mclk else self._dpm_current("pp_dpm_mclk")
+        if not res["ClockCore"]:
+            for fp in self.freq_paths:
+                v = read_int(fp)
+                if v:
+                    res["ClockCore"] = v
+                    break
+        return res
+
+
+def make_gpu():
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        return NvidiaGpu(smi)
+    return DrmGpu.find()
+
+
+# ── Battery / network / disks ────────────────────────────────────────────────
+
+def get_battery():
+    for ps in sorted(glob.glob("/sys/class/power_supply/*")):
+        if read_text(ps + "/type") != "Battery" or read_text(ps + "/scope", "") == "Device":
+            continue
+        cap = read_int(ps + "/capacity")
+        if cap is None:
+            continue
+        status = read_text(ps + "/status", "Unknown")
+        secs = None
+        if status == "Discharging":
+            for now_f, rate_f in (("energy_now", "power_now"), ("charge_now", "current_now")):
+                amount, rate = read_int(f"{ps}/{now_f}"), read_int(f"{ps}/{rate_f}")
+                if amount and rate:
+                    secs = int(amount / rate * 3600)
+                    break
+        return cap, status, secs
+    return None
+
+
+def get_net_counters():
+    rx = tx = prx = ptx = 0
+    phys = False
+    with open("/proc/net/dev") as f:
+        for line in f.readlines()[2:]:
+            name, _, data = line.partition(":")
+            name = name.strip()
+            parts = data.split()
+            if name == "lo" or len(parts) < 9:
+                continue
+            r, t = int(parts[0]), int(parts[8])
+            rx, tx = rx + r, tx + t
+            # Count only physical NICs so bridges/VPN tunnels don't double-count traffic
+            if os.path.exists(f"/sys/class/net/{name}/device"):
+                phys = True
+                prx, ptx = prx + r, ptx + t
+    return (prx, ptx) if phys else (rx, tx)
+
+
+SKIP_FS = {"squashfs", "iso9660", "udf", "tmpfs", "devtmpfs", "overlay"}
+SKIP_MOUNT_PREFIXES = ("/boot", "/snap/", "/var/snap/", "/run/", "/var/lib/docker",
+                       "/var/lib/containers")
+
+
+def _unescape_mount(s):
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
+
+
+def get_disks():
+    mounts = []
+    with open("/proc/mounts") as f:
+        for line in f:
+            p = line.split()
+            if len(p) < 3:
+                continue
+            dev, mnt, fs = p[0], _unescape_mount(p[1]), p[2]
+            if not dev.startswith("/dev/") or dev.startswith("/dev/loop") or fs in SKIP_FS:
+                continue
+            if mnt != "/" and mnt.startswith(SKIP_MOUNT_PREFIXES):
+                continue
+            # Read-only mounts are images/media, not disks you fill up
+            if mnt != "/" and len(p) > 3 and "ro" in p[3].split(","):
+                continue
+            mounts.append((dev, mnt))
+    # Same device mounted several times (btrfs subvolumes, bind mounts): keep the shortest path
+    mounts.sort(key=lambda m: (m[1] != "/", len(m[1])))
+    seen, disks = set(), []
+    for dev, mnt in mounts:
+        real = os.path.realpath(dev)
+        if real in seen:
+            continue
+        try:
+            st = os.statvfs(mnt)
+        except OSError:
+            continue
+        total = st.f_blocks * st.f_frsize
+        if total == 0:
+            continue
+        seen.add(real)
+        used = (st.f_blocks - st.f_bfree) * st.f_frsize
+        avail = st.f_bavail * st.f_frsize
+        disks.append({
+            "mnt": mnt, "kname": os.path.basename(real), "total": total, "used": used,
+            "pct": used / (used + avail) * 100.0 if used + avail else 0.0,
+        })
+    disks.sort(key=lambda d: (d["mnt"] != "/", -d["total"]))
+    return disks
+
+
+def get_diskstats():
+    out = {}
+    with open("/proc/diskstats") as f:
+        for line in f:
+            p = line.split()
+            if len(p) >= 10:
+                out[p[2]] = (int(p[5]) * 512, int(p[9]) * 512)   # sectors are always 512 B here
+    return out
+
+
+# ── Processes ────────────────────────────────────────────────────────────────
+
+class Proc:
+    __slots__ = ("pid", "name", "cpu", "mem_mb", "mem_pct")
+
+    def __init__(self, pid, name, cpu, mem_mb, mem_pct):
+        self.pid, self.name, self.cpu, self.mem_mb, self.mem_pct = pid, name, cpu, mem_mb, mem_pct
+
+
+class ProcSampler:
+    PF_KTHREAD = 0x00200000
+
+    def __init__(self):
+        self.hz = os.sysconf("SC_CLK_TCK")
+        self.page = os.sysconf("SC_PAGE_SIZE")
+        self.prev = {}
+        self.names = {}
+        self.prev_t = time.monotonic()
+        self.sample(1, 1)
+
+    @staticmethod
+    def _full_name(ent, comm):
+        # comm is truncated to 15 chars by the kernel; recover the full name from argv[0]
+        if len(comm) < 15:
+            return comm
+        try:
+            with open(f"/proc/{ent}/cmdline", "rb") as f:
+                argv0 = f.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+            base = os.path.basename(argv0.split(" ")[0])
+            if base.startswith(comm):
+                return base
+        except OSError:
+            pass
+        return comm
+
+    def sample(self, mem_total, cores):
+        now = time.monotonic()
+        elapsed = max(1e-3, now - self.prev_t)
+        cur, names, procs, pids = {}, {}, [], []
+        for ent in os.listdir("/proc"):
+            if not ent.isdigit():
+                continue
+            try:
+                with open(f"/proc/{ent}/stat", "rb") as f:
+                    data = f.read().decode("utf-8", "replace")
+            except OSError:
+                continue
+            pids.append(int(ent))
+            lp, rp = data.find("("), data.rfind(")")
+            comm = data[lp + 1:rp]
+            fields = data[rp + 2:].split()
+            try:
+                flags = int(fields[6])
+                ticks = int(fields[11]) + int(fields[12])
+                start = fields[19]
+                rss = int(fields[21]) * self.page
+            except (IndexError, ValueError):
+                continue
+            if flags & self.PF_KTHREAD:
+                continue
+            key = (ent, start)
+            cur[key] = ticks
+            cpu = 0.0
+            if key in self.prev:
+                cpu = max(0.0, (ticks - self.prev[key]) / self.hz / elapsed / cores * 100.0)
+            name = self.names.get(key) or self._full_name(ent, comm)
+            names[key] = name
+            procs.append(Proc(int(ent), name, cpu, rss / MB, rss / mem_total * 100.0))
+        self.prev, self.names, self.prev_t = cur, names, now
+        return procs, pids
+
+
+# ── Formatting (ported from ptop) ────────────────────────────────────────────
+
+SPARK_CHARS = " ▁▂▃▄▅▆▇█"
+
+
+class Quit(Exception):
+    pass
+
+
+class App:
+    def __init__(self, refresh_ms, theme_idx):
+        self.refresh_ms = refresh_ms
+        self.theme_idx = theme_idx
+        self.C = THEMES[theme_idx]
+        self.sort_by = "CPU"
+        self.show_per_core = True
+        self.sel = 0
+        self.sel_pid = None
+        self.status_msg = ""
+        self.status_until = 0.0
+        self.displayed = []
+        self.filter_text = ""
+        self.filter_mode = False
+        self.last_kill = None
+        self.last_size = None
+        self.resized = False
+
+        self.hostname = socket.gethostname()
+        self.cpu_name = get_cpu_name()
+        self.logical_cores = os.cpu_count() or 1
+        self.cpu = CpuSampler()
+        self.procs = ProcSampler()
+        self.gpu = None
+        try:
+            self.gpu = make_gpu()
+        except Exception:
+            self.gpu = None
+
+        self.cpu_hist, self.gpu_hist = [], []
+        self.prev_net = get_net_counters()
+        self.prev_net_t = time.monotonic()
+        self.prev_disk = get_diskstats()
+        self.prev_disk_t = time.monotonic()
+        self.snap = None
+
+    # ── colors / small formatters ──
+    def meter_color(self, pct):
+        C = self.C
+        if pct < 40:
+            return C.Green
+        if pct < 70:
+            return C.Cyan
+        if pct < 85:
+            return C.Yellow
+        return C.Red
+
+    def temp_color(self, t):
+        C = self.C
+        if t < 55:
+            return C.Green
+        if t < 72:
+            return C.Yellow
+        if t < 83:
+            return C.Orange
+        return C.Red
+
+    def bar(self, pct, width, color=""):
+        if width < 2:
+            return ""
+        pct = clamp(pct)
+        color = color or self.meter_color(pct)
+        filled = int(round(pct / 100.0 * width))
+        return f"{color}{'█' * filled}{self.C.Dim}{'░' * (width - filled)}{self.C.Reset}"
+
+    def sparkline(self, hist, width, color):
+        if width < 1:
+            return ""
+        out = [color]
+        n = len(hist)
+        for i in range(n - width, n):
+            if i < 0:
+                out.append("·")
+            else:
+                out.append(SPARK_CHARS[int(round(clamp(hist[i]) / 100.0 * 8))])
+        out.append(self.C.Reset)
+        return "".join(out)
+
+    @staticmethod
+    def fmt_rate(bps):
+        if bps >= 100 * MB:
+            s = f"{bps / MB:.0f}M/s"
+        elif bps >= MB:
+            s = f"{bps / MB:.1f}M/s"
+        else:
+            s = f"{bps / KB:.0f}K/s"
+        return s.rjust(7)
+
+    def fmt_battery(self, bat):
+        if not bat:
+            return ""
+        C = self.C
+        pct, status, secs = bat
+        col = C.Green if pct > 50 else (C.Yellow if pct > 20 else C.Red)
+        if status == "Charging":
+            state = "charging"
+        elif status == "Discharging":
+            state = f"{secs // 3600}h {secs % 3600 // 60:02d}m left" if secs else "on battery"
+        else:
+            state = "AC"
+        return f" {C.Dim}│ Bat: {col}{pct}% {C.Dim}({state})"
+
+    @staticmethod
+    def pad_ansi(s, width):
+        clean = ANSI_RE.sub("", s)
+        if len(clean) > width:
+            return clean[:max(0, width - 1)] + "…"
+        return s + " " * (width - len(clean))
+
+    def box_line(self, left, lw, right, rw):
+        C = self.C
+        return (f"{C.Border}│{C.Reset} {self.pad_ansi(left, lw)} {C.Border}││{C.Reset} "
+                f"{self.pad_ansi(right, rw)} {C.Border}│{C.Reset}")
+
+    def full_line(self, content, inner):
+        C = self.C
+        return f"{C.Border}│{C.Reset} {self.pad_ansi(content, inner)} {C.Border}│{C.Reset}"
+
+    def set_status(self, msg, secs):
+        self.status_msg = msg
+        self.status_until = time.monotonic() + secs
+
+    # ── data collection ──
+    def collect(self):
+        s = {}
+        s["cpu_pct"], s["cores"] = self.cpu.sample()
+        mem = get_meminfo()
+        s["ram_total"] = mem.get("MemTotal", 1)
+        s["ram_used"] = s["ram_total"] - mem.get("MemAvailable", 0)
+        s["ram_pct"] = s["ram_used"] / s["ram_total"] * 100.0
+        s["swap_total"] = mem.get("SwapTotal", 0)
+        s["swap_used"] = s["swap_total"] - mem.get("SwapFree", 0)
+        s["swap_pct"] = s["swap_used"] / s["swap_total"] * 100.0 if s["swap_total"] else 0.0
+
+        procs, pids = self.procs.sample(s["ram_total"], self.logical_cores)
+        s["procs"], s["proc_count"] = procs, len(pids)
+
+        gpu = new_gpu_stats()
+        if self.gpu:
+            try:
+                gpu = self.gpu.sample(pids)
+            except Exception:
+                pass
+        s["gpu"] = gpu
+        s["vram_pct"] = gpu["MemUsedMB"] / gpu["MemTotMB"] * 100.0 if gpu["MemTotMB"] else 0.0
+
+        for hist, val in ((self.cpu_hist, s["cpu_pct"]), (self.gpu_hist, gpu["Util"])):
+            hist.append(val)
+            if len(hist) > 120:
+                del hist[0]
+
+        now = time.monotonic()
+        try:
+            rx, tx = get_net_counters()
+        except OSError:
+            rx, tx = self.prev_net
+        dt = max(0.1, now - self.prev_net_t)
+        s["rx_bps"] = max(0.0, (rx - self.prev_net[0]) / dt)
+        s["tx_bps"] = max(0.0, (tx - self.prev_net[1]) / dt)
+        s["rx_total"], s["tx_total"] = rx, tx
+        self.prev_net, self.prev_net_t = (rx, tx), now
+
+        try:
+            s["disks"] = get_disks()
+        except OSError:
+            s["disks"] = []
+        rates = {}
+        try:
+            ds = get_diskstats()
+            ddt = max(0.1, now - self.prev_disk_t)
+            for k, (rd, wr) in ds.items():
+                if k in self.prev_disk:
+                    rates[k] = (max(0.0, (rd - self.prev_disk[k][0]) / ddt),
+                                max(0.0, (wr - self.prev_disk[k][1]) / ddt))
+            self.prev_disk, self.prev_disk_t = ds, now
+        except OSError:
+            pass
+        s["disk_rates"] = rates
+
+        try:
+            s["battery"] = get_battery()
+        except OSError:
+            s["battery"] = None
+        try:
+            s["uptime"] = float(read_text("/proc/uptime", "0").split()[0])
+        except (ValueError, IndexError):
+            s["uptime"] = 0.0
+        self.snap = s
+
+    # ── rendering ──
+    def render(self):
+        C, s = self.C, self.snap
+        term_w, term_h = shutil.get_terminal_size((100, 30))
+        if (term_w, term_h) != self.last_size:
+            self.last_size = (term_w, term_h)
+            sys.stdout.buffer.write(f"{ESC}[2J".encode())
+        win_w, win_h = max(84, term_w), max(24, term_h)
+        avail_w = win_w - 8
+        lw = avail_w // 2
+        rw = avail_w - lw
+        full_w = win_w - 4
+        gpu = s["gpu"]
+        gpu_pids = gpu["GpuPids"]
+        lines = []
+
+        # Header bar
+        clock = datetime.now().strftime("%H:%M:%S")
+        up = int(s["uptime"])
+        up_str = f"{up // 86400}d {up % 86400 // 3600:02d}h {up % 3600 // 60:02d}m"
+        banner = f" │ {C.Orange}{self.status_msg}" if time.monotonic() < self.status_until else ""
+        hdr_l = (f"{C.Title} shtop {C.Dim}│ {C.Cyan}{self.hostname} {C.Dim}│ Up: {C.Text}{up_str}"
+                 f"{self.fmt_battery(s['battery'])} {C.Dim}│ {C.Yellow}{self.refresh_ms}ms{banner}")
+        hdr_r = (f"{C.Dim}[{C.Yellow}P{C.Dim}]Cores [{C.Yellow}T{C.Dim}]heme [{C.Yellow}C/M/G{C.Dim}]Sort "
+                 f"[{C.Yellow}↑↓/K{C.Dim}]Kill [{C.Yellow}Q{C.Dim}]uit │ {C.Cyan}{clock} ")
+        len_l, len_r = visible_len(hdr_l), visible_len(hdr_r)
+        if len_l + len_r + 1 > win_w:   # narrow window: drop the key hints instead of wrapping
+            hdr_r = f"{C.Cyan}{clock} "
+            len_r = len(clock) + 1
+        if len_l + len_r > win_w:
+            hdr_l = self.pad_ansi(hdr_l, max(1, win_w - len_r - 1))
+            len_l = visible_len(hdr_l)
+        lines.append(hdr_l + " " * max(1, win_w - len_l - len_r) + hdr_r + C.Reset)
+
+        # ── ROW 1: CPU (left) & GPU (right) ──
+        def titled(label, sub, width):
+            room = max(3, width + 2 - len(label) - 6)   # "─ LABEL (" + sub + ") "
+            if len(sub) > room:
+                sub = sub[:room - 1] + "…"
+            return f"─{C.Title} {label} {C.SubTitle}({sub}) {C.Border}"
+
+        pstate = f" [{gpu['PState']}]" if gpu["PState"] else ""
+        cpu_t = titled("CPU", self.cpu_name, lw)
+        gpu_t = titled("GPU", gpu["Name"] + pstate, rw)
+        lines.append(f"{C.Border}╭{cpu_t}{'─' * max(0, lw + 2 - visible_len(cpu_t))}╮╭{gpu_t}"
+                     f"{'─' * max(0, rw + 2 - visible_len(gpu_t))}╮{C.Reset}")
+
+        bar_w = max(10, lw - 22)
+        rbar_w = max(10, rw - 26)
+        spark_w = max(10, lw - 12)
+        rspark_w = max(10, rw - 12)
+
+        cpu_pct, util = s["cpu_pct"], gpu["Util"]
+        l1 = f"{C.Text}CPU Total  {self.bar(cpu_pct, bar_w)} {self.meter_color(cpu_pct)}{cpu_pct:5.1f}%{C.Reset}"
+        r1 = f"{C.Text}GPU Core   {self.bar(util, rbar_w)} {self.meter_color(util)}{util:5.1f}%{C.Reset}"
+        lines.append(self.box_line(l1, lw, r1, rw))
+
+        l2 = f"{C.Dim}History    {self.sparkline(self.cpu_hist, spark_w, self.meter_color(cpu_pct))}"
+        r2 = f"{C.Dim}History    {self.sparkline(self.gpu_hist, rspark_w, self.meter_color(util))}"
+        lines.append(self.box_line(l2, lw, r2, rw))
+
+        l3 = (f"{C.Text}RAM        {self.bar(s['ram_pct'], bar_w)} {C.Cyan}"
+              f"{s['ram_used'] / GB:4.1f}/{s['ram_total'] / GB:.1f}G{C.Reset}")
+        if gpu["MemTotMB"]:
+            r3 = (f"{C.Text}VRAM       {self.bar(s['vram_pct'], rbar_w - 4)} {C.Magenta}"
+                  f"{gpu['MemUsedMB'] / 1024:4.1f}/{gpu['MemTotMB'] / 1024:.1f}G ({s['vram_pct']:.0f}%){C.Reset}")
+        else:
+            r3 = f"{C.Text}VRAM       {C.Dim}N/A (shared system memory){C.Reset}"
+        lines.append(self.box_line(l3, lw, r3, rw))
+
+        l4 = (f"{C.Text}Swap       {self.bar(s['swap_pct'], bar_w)} {C.Dim}"
+              f"{s['swap_used'] / GB:4.1f}/{s['swap_total'] / GB:.1f}G{C.Reset}")
+        pw, pcap = gpu["PowerW"], gpu["PowerCapW"]
+        if pw is not None and pcap:
+            r4 = (f"{C.Text}Power      {self.bar(pw / pcap * 100.0, rbar_w - 4, C.Yellow)} {C.Yellow}"
+                  f"{pw:5.1f}/{pcap:.0f}W{C.Reset}")
+        elif pw is not None:
+            r4 = f"{C.Text}Power      {C.Yellow}{pw:5.1f}W{C.Reset}"
+        else:
+            r4 = f"{C.Text}Power      {C.Dim}N/A{C.Reset}"
+        lines.append(self.box_line(l4, lw, r4, rw))
+
+        l5 = (f"{C.Dim}Cores: {C.Text}{self.logical_cores} {C.Dim}([P] Per-Core)   "
+              f"Procs: {C.Text}{s['proc_count']}")
+        parts = []
+        if gpu["Temp"] is not None:
+            parts.append(f"{C.Dim}Temp: {self.temp_color(gpu['Temp'])}{gpu['Temp']:.0f}°C")
+        if gpu["FanPct"] is not None:
+            parts.append(f"{C.Dim}Fan: {C.Cyan}{gpu['FanPct']:.0f}%")
+        if gpu["ClockCore"]:
+            mem_clk = f"{C.Dim}/{C.Magenta}{gpu['ClockMem']}" if gpu["ClockMem"] else ""
+            parts.append(f"{C.Dim}Clocks: {C.Green}{gpu['ClockCore']}{mem_clk}MHz")
+        if gpu["MemUtil"] is not None:
+            parts.append(f"{C.Dim}MemCtrl: {C.Text}{gpu['MemUtil']:.0f}%")
+        r5 = "  ".join(parts) if parts else f"{C.Dim}Temp/Fan/Clocks: N/A"
+        lines.append(self.box_line(l5, lw, r5, rw))
+
+        extra = 0
+        cores = s["cores"]
+        if self.show_per_core and cores:
+            ct = f"─{C.Title} Per-Core CPU Utilization {C.Border}"
+            lines.append(f"{C.Border}├{ct}{'─' * max(0, lw + 2 - visible_len(ct))}┴"
+                         f"{'─' * (rw + 3)}┤{C.Reset}")
+            extra += 1
+            cols = 4
+            cell_w = (full_w - (cols - 1) * 2) // cols
+            mini_w = max(4, cell_w - 11)
+            for i in range(0, len(cores), cols):
+                cells = []
+                for idx, cp in cores[i:i + cols]:
+                    cell = (f"{C.Dim}C{idx:<2}{C.Reset} {self.bar(cp, mini_w)} "
+                            f"{self.meter_color(cp)}{cp:4.0f}%{C.Reset}")
+                    cells.append(self.pad_ansi(cell, cell_w))
+                cells += [" " * cell_w] * (cols - len(cells))
+                lines.append(self.full_line("  ".join(cells), full_w))
+                extra += 1
+
+        # ── ROW 2: DISKS (left) & NETWORK (right) ──
+        dt_ = f"─{C.Title} Disks {C.Border}"
+        nt_ = f"─{C.Title} Network {C.Border}"
+        if self.show_per_core and cores:
+            mid = (f"{C.Border}├{dt_}{'─' * max(0, lw + 2 - visible_len(dt_))}┬{nt_}"
+                   f"{'─' * max(0, rw + 3 - visible_len(nt_))}┤{C.Reset}")
+        else:
+            mid = (f"{C.Border}├{dt_}{'─' * max(0, lw + 2 - visible_len(dt_))}┤├{nt_}"
+                   f"{'─' * max(0, rw + 2 - visible_len(nt_))}┤{C.Reset}")
+        lines.append(mid)
+
+        disks = s["disks"][:4]
+        disk_rows = max(2, len(disks))
+        label_w = min(10, max([4] + [len(d["mnt"]) for d in disks]))
+        dsk_lines = []
+        for d in disks:
+            label = d["mnt"] if len(d["mnt"]) <= label_w else d["mnt"][:label_w - 1] + "…"
+            io = s["disk_rates"].get(d["kname"])
+            io_str = (f" {C.Green}R{self.fmt_rate(io[0])} {C.Yellow}W{self.fmt_rate(io[1])}"
+                      if io else "")
+            dbar_w = max(4, lw - 38 - (label_w - 4))
+            dsk_lines.append(f"{C.Text}{label.ljust(label_w)}{self.bar(d['pct'], dbar_w)} {C.Cyan}"
+                             f"{d['used'] / GB:4.0f}/{d['total'] / GB:.0f}G {d['pct']:3.0f}%{io_str}{C.Reset}")
+        dsk_lines += [""] * (disk_rows - len(dsk_lines))
+
+        def rate_str(bps):
+            kbs = bps / KB
+            return f"{kbs / 1024:.2f} MB/s" if kbs >= 1024 else f"{kbs:.1f} KB/s"
+
+        net_lines = [
+            f"{C.Green}▼ Download {C.Text}{rate_str(s['rx_bps']).ljust(14)} {C.Dim}Total RX: "
+            f"{C.Text}{s['rx_total'] / GB:.2f} GB",
+            f"{C.Yellow}▲ Upload   {C.Text}{rate_str(s['tx_bps']).ljust(14)} {C.Dim}Total TX: "
+            f"{C.Text}{s['tx_total'] / GB:.2f} GB",
+        ]
+        net_lines += [""] * (disk_rows - len(net_lines))
+        for dl, nl in zip(dsk_lines, net_lines):
+            lines.append(self.box_line(dl, lw, nl, rw))
+        lines.append(f"{C.Border}╰{'─' * (lw + 2)}╯╰{'─' * (rw + 2)}╯{C.Reset}")
+
+        # ── ROW 3: PROCESSES (full width) ──
+        if self.filter_mode:
+            ftag = (f"Filter: {C.Yellow}{self.filter_text}{C.Text}_ {C.Dim}[Enter]Keep [Esc]Clear"
+                    f"{C.SubTitle}")
+        elif self.filter_text:
+            ftag = f"Filter: {C.Yellow}{self.filter_text} {C.Dim}[Esc]Clear{C.SubTitle}"
+        else:
+            ftag = f"[{C.Yellow}/{C.SubTitle}]Filter"
+        pt = (f"─{C.Title} Processes {C.SubTitle}(Sort: {C.Yellow}{self.sort_by}{C.SubTitle} │ {ftag} │ "
+              f"GPU Apps: {C.Green}{len(gpu_pids)}{C.SubTitle} │ Theme: {C.Cyan}{C.Name}{C.SubTitle}) "
+              f"{C.Border}")
+        lines.append(f"{C.Border}╭{pt}{'─' * max(0, full_w + 2 - visible_len(pt))}╮{C.Reset}")
+
+        name_w = max(18, full_w - 58)
+        hdr = (f"{'PID':>7}  {'PROCESS NAME':<{name_w}}  {'CPU %':>7}  {'MEM (MB)':>9}  "
+               f"{'MEM %':>6}  {'GPU STATUS':<16}")
+        lines.append(self.full_line(f"{C.HeaderBg}{hdr.ljust(full_w)}{C.Reset}", full_w))
+
+        procs = s["procs"]
+        if self.filter_text:
+            ft = self.filter_text.lower()
+            procs = [p for p in procs if ft in p.name.lower() or str(p.pid).startswith(self.filter_text)]
+        if self.sort_by == "MEM":
+            procs = sorted(procs, key=lambda p: p.mem_mb, reverse=True)
+        elif self.sort_by == "GPU":
+            procs = sorted(procs, key=lambda p: (p.pid in gpu_pids, gpu_pids.get(p.pid, -1),
+                                                 p.cpu, p.mem_mb), reverse=True)
+        else:
+            procs = sorted(procs, key=lambda p: (p.cpu, p.mem_mb), reverse=True)
+
+        used = 15 + extra + (disk_rows - 2)
+        rows = max(3, win_h - used)
+        self.displayed = procs[:rows]
+        # Keep the highlight on the same process as the list re-sorts (safer kills)
+        if self.sel_pid is not None:
+            for i, p in enumerate(self.displayed):
+                if p.pid == self.sel_pid:
+                    self.sel = i
+                    break
+        if self.sel >= len(self.displayed):
+            self.sel = max(0, len(self.displayed) - 1)
+
+        short = gpu["ShortName"]
+        for r, p in enumerate(self.displayed):
+            name = p.name if len(p.name) <= name_w else p.name[:name_w - 1] + "…"
+            on_gpu = p.pid in gpu_pids
+            g_pct = gpu_pids.get(p.pid, 0)
+            g_text = (f"● {short} ({g_pct}%)" if g_pct > 0 else f"● {short} (Active)") if on_gpu else "·"
+            if r == self.sel:
+                plain = (f"{p.pid:>7}  {name:<{name_w}}  {p.cpu:6.1f}%  {p.mem_mb:8.1f}M  "
+                         f"{p.mem_pct:5.1f}%  {g_text:<19}")
+                lines.append(self.full_line(f"{C.SelBg}{plain.ljust(full_w)}{C.Reset}", full_w))
+            else:
+                badge = f"{C.GpuTag}{g_text}{C.Reset}" if on_gpu else f"{C.Dim}·{C.Reset}"
+                row = (f"{C.Dim}{p.pid:>7}  {C.Text}{name.ljust(name_w)}  "
+                       f"{self.meter_color(p.cpu * 2)}{p.cpu:6.1f}%  {C.Cyan}{p.mem_mb:8.1f}M  "
+                       f"{self.meter_color(p.mem_pct * 2)}{p.mem_pct:5.1f}%  {badge}")
+                lines.append(self.full_line(row, full_w))
+        if self.filter_text and not self.displayed:
+            lines.append(self.full_line(f"{C.Dim}  No processes match '{self.filter_text}'", full_w))
+
+        lines.append(f"{C.Border}╰{'─' * (full_w + 2)}╯{C.Reset}")
+        frame = f"{ESC}[H" + "\n".join(lines) + f"{ESC}[J"
+        sys.stdout.buffer.write(frame.encode("utf-8", "replace"))
+        sys.stdout.flush()
+
+    # ── input ──
+    def kill_selected(self):
+        if len(self.displayed) <= self.sel:
+            return
+        p = self.displayed[self.sel]
+        now = time.monotonic()
+        escalate = self.last_kill and self.last_kill[0] == p.pid and now - self.last_kill[1] < 3
+        sig = signal.SIGKILL if escalate else signal.SIGTERM
+        try:
+            os.kill(p.pid, sig)
+            if escalate:
+                msg = f"Killed {p.name} (PID {p.pid}) with SIGKILL"
+                self.last_kill = None
+            else:
+                msg = f"Sent SIGTERM to {p.name} (PID {p.pid}) - K again to SIGKILL"
+                self.last_kill = (p.pid, now)
+        except PermissionError:
+            msg = f"Failed to kill PID {p.pid}: Permission denied"
+        except ProcessLookupError:
+            msg = f"PID {p.pid} has already exited"
+        self.set_status(msg, 3)
+
+    def move_sel(self, delta):
+        self.sel = max(0, self.sel + delta)
+        if self.displayed:
+            self.sel = min(self.sel, len(self.displayed) - 1)
+            self.sel_pid = self.displayed[self.sel].pid
+
+    def reset_sel(self):
+        self.sel, self.sel_pid = 0, None
+
+    def handle_key(self, k):
+        if self.filter_mode:
+            if k == "ENTER":
+                self.filter_mode = False
+            elif k == "ESC":
+                self.filter_mode, self.filter_text = False, ""
+            elif k == "BS":
+                self.filter_text = self.filter_text[:-1]
+            elif len(k) == 1 and k.isprintable():
+                self.filter_text += k
+            self.reset_sel()
+            return
+        if k == "/":
+            self.filter_mode = True
+            self.reset_sel()
+            return
+        k = k.lower() if len(k) == 1 else k
+        if k == "q":
+            raise Quit()
+        if k == "ESC":
+            if self.filter_text:
+                self.filter_text = ""
+                self.reset_sel()
+            else:
+                raise Quit()
+        elif k in ("c", "m", "g"):
+            self.sort_by = {"c": "CPU", "m": "MEM", "g": "GPU"}[k]
+            self.reset_sel()
+        elif k == "p":
+            self.show_per_core = not self.show_per_core
+        elif k == "t":
+            self.theme_idx = (self.theme_idx + 1) % len(THEMES)
+            self.C = THEMES[self.theme_idx]
+            self.set_status(f"Theme: {self.C.Name}", 2)
+        elif k == "UP":
+            self.move_sel(-1)
+        elif k == "DOWN":
+            self.move_sel(1)
+        elif k in ("k", "DEL"):
+            self.kill_selected()
+        elif k in ("+", "="):
+            self.refresh_ms = max(250, self.refresh_ms - 250)
+        elif k in ("-", "_"):
+            self.refresh_ms = min(5000, self.refresh_ms + 250)
+
+    @staticmethod
+    def parse_keys(data):
+        seqs = {"\x1b[A": "UP", "\x1bOA": "UP", "\x1b[B": "DOWN", "\x1bOB": "DOWN", "\x1b[3~": "DEL"}
+        keys, i = [], 0
+        while i < len(data):
+            c = data[i]
+            if c == "\x1b":
+                if i + 1 < len(data) and data[i + 1] in "[O":
+                    j = i + 2
+                    while j < len(data) and not (data[j].isalpha() or data[j] == "~"):
+                        j += 1
+                    keys.append(seqs.get(data[i:j + 1], ""))
+                    i = j + 1
+                    continue
+                keys.append("ESC")
+            elif c in "\r\n":
+                keys.append("ENTER")
+            elif c in "\x7f\x08":
+                keys.append("BS")
+            else:
+                keys.append(c)
+            i += 1
+        return [k for k in keys if k]
+
+    def read_input(self, fd):
+        data = os.read(fd, 256)
+        # A lone ESC may be the start of an arrow-key sequence split across reads
+        if data.endswith(b"\x1b") and select.select([fd], [], [], 0.03)[0]:
+            data += os.read(fd, 256)
+        for k in self.parse_keys(data.decode("utf-8", "replace")):
+            self.handle_key(k)
+
+    def run(self):
+        fd = sys.stdin.fileno()
+        next_sample = 0.0
+        while True:
+            if time.monotonic() >= next_sample:
+                start = time.monotonic()
+                self.collect()
+                next_sample = start + self.refresh_ms / 1000.0
+            self.render()
+            # Wait out the interval, but redraw at once on a key press or resize
+            while True:
+                remain = next_sample - time.monotonic()
+                if remain <= 0 or self.resized:
+                    self.resized = False
+                    break
+                try:
+                    ready = select.select([fd], [], [], min(remain, 0.1))[0]
+                except InterruptedError:
+                    continue
+                if ready:
+                    self.read_input(fd)
+                    break
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="shtop", description="Zero-root system & GPU monitor for Linux.")
+    ap.add_argument("-r", "--refresh-ms", type=int, default=1000,
+                    help="refresh interval in milliseconds (250-5000, default 1000)")
+    ap.add_argument("-t", "--theme", default="Midnight",
+                    choices=[t.Name for t in THEMES], type=lambda s: s.capitalize(),
+                    help="starting color theme")
+    args = ap.parse_args()
+
+    if not os.path.exists("/proc/stat"):
+        sys.exit("shtop needs Linux (/proc not found).")
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        sys.exit("shtop needs an interactive terminal.")
+
+    refresh = max(250, min(5000, args.refresh_ms))
+    theme_idx = next(i for i, t in enumerate(THEMES) if t.Name == args.theme)
+    app = App(refresh, theme_idx)
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+
+    def on_winch(_sig, _frm):
+        app.resized = True
+
+    def on_term(_sig, _frm):
+        raise Quit()
+
+    signal.signal(signal.SIGWINCH, on_winch)
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGHUP, on_term)
+
+    crash = None
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.buffer.write(f"{ESC}[?1049h{ESC}[?25l{ESC}[2J".encode())
+        sys.stdout.flush()
+        app.run()
+    except (Quit, KeyboardInterrupt):
+        pass
+    except Exception:
+        crash = traceback.format_exc()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        sys.stdout.buffer.write(f"{ESC}[?25h{ESC}[?1049l{ESC}[0m".encode())
+        sys.stdout.flush()
+    if crash:
+        sys.stderr.write("shtop crashed:\n" + crash)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
