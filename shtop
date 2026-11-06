@@ -281,6 +281,15 @@ class NvidiaGpu:
             res["ClockCore"] = int(core) if core else None
             res["ClockMem"] = int(mem) if mem else None
             res["PState"] = parts[11]
+        else:
+            # nvidia-smi prints NVML errors (e.g. driver/library mismatch after a
+            # driver update without a reboot) to stdout. Surface them in the panel.
+            err = lines[0].strip() if lines else "nvidia-smi returned no data"
+            err = re.sub(r"^Failed to initialize NVML:\s*", "", err)
+            if "mismatch" in err.lower():
+                err += " (reboot needed)"
+            res["Name"] = f"NVIDIA: {err}"
+            return res
 
         for pl in self._run("pmon", "-c", "1").splitlines():
             m = re.match(r"^\s*\d+\s+(\d+)\s+(\S+)\s+(\S+)", pl)
