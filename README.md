@@ -56,13 +56,18 @@ cd shelltop
 ./shtop
 ```
 
-### Put it on your PATH (optional)
+### Install the `shtop` alias (optional)
+Run the included installer to add a `shtop` alias to your shell config (`~/.bashrc`, `~/.zshrc` or fish `config.fish`, picked from `$SHELL`):
 ```bash
-mkdir -p ~/.local/bin
-ln -s "$PWD/shtop" ~/.local/bin/shtop
+./install.sh
+```
+
+Or add the alias manually:
+```bash
+echo "alias shtop='$PWD/shtop'" >> ~/.bashrc
+. ~/.bashrc
 shtop
 ```
-(`~/.local/bin` is on `PATH` by default on most distros. A symlink means a `git pull` updates it.)
 
 ---
 
