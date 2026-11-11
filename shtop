@@ -10,13 +10,14 @@ from amdgpu sysfs, and per-process GPU activity for AMD/Intel from DRM fdinfo.
 Controls:
   [Q] / [Esc] : Quit (Esc clears an active filter first; Ctrl+C also quits)
   [/]         : Filter processes by name or PID (Enter keeps, Esc clears)
-  [Up]/[Down] : Select process in table
-  [K] / [Del] : Send SIGTERM to selected process (press again within 3s: SIGKILL)
+  [Up]/[Down] : Select process (also PgUp/PgDn/Home/End; the list scrolls)
+  [K] / [Del] : Kill selected process (asks: [Y] SIGTERM, [9] SIGKILL)
   [P]         : Toggle Per-Core CPU bars view
   [T]         : Cycle color themes (Midnight, Cyberpunk, Matrix, Gruvbox, Nord)
   [C]         : Sort processes by CPU%
   [M]         : Sort processes by Memory
   [G]         : Prioritize GPU processes
+  [I]         : Sort processes by disk I/O rate
   [+] / [-]   : Increase / Decrease refresh speed
 """
 
@@ -31,6 +32,7 @@ import socket
 import subprocess
 import sys
 import termios
+import threading
 import time
 import traceback
 import tty
@@ -202,6 +204,120 @@ def get_meminfo():
     return m
 
 
+# ── CPU sensors ──────────────────────────────────────────────────────────────
+
+class CpuSensors:
+    """CPU temperature, per-core temperatures, clock and package power, without root.
+
+    Temperature comes from the kernel's hwmon drivers (coretemp on Intel, k10temp or
+    zenpower on AMD, cpu_thermal on ARM). With none of those it falls back to a thermal
+    zone; a generic ACPI zone is tagged "ACPI" in the UI because it is often not the CPU.
+    Package power needs RAPL's energy counter, which most distros make root-only, so it
+    only shows where that file happens to be readable.
+    """
+    HWMON = "/sys/class/hwmon"
+    THERMAL = "/sys/class/thermal"
+    CPU_SYS = "/sys/devices/system/cpu"
+    RAPL = "/sys/class/powercap"
+    DRIVERS = ("coretemp", "k10temp", "zenpower", "cpu_thermal")
+
+    def __init__(self):
+        self.tag = ""
+        self.pkg_inputs = []     # files holding a package / die temperature
+        self.core_inputs = {}    # (package id, core id) -> temp file (coretemp only)
+        for hw in sorted(glob.glob(self.HWMON + "/hwmon*")):
+            name = read_text(hw + "/name", "")
+            if name not in self.DRIVERS:
+                continue
+            inputs = [(read_text(p[:-5] + "label", ""), p)
+                      for p in sorted(glob.glob(hw + "/temp*_input"))]
+            if name == "coretemp":
+                pkg_id = 0
+                for label, p in inputs:
+                    m = re.fullmatch(r"Package id (\d+)", label)
+                    if m:
+                        pkg_id = int(m.group(1))
+                        self.pkg_inputs.append(p)
+                for label, p in inputs:
+                    m = re.fullmatch(r"Core (\d+)", label)
+                    if m:
+                        self.core_inputs[(pkg_id, int(m.group(1)))] = p
+                continue
+            for want in ("Tdie", "Tctl"):
+                hit = [p for label, p in inputs if label == want]
+                if hit:
+                    self.pkg_inputs.append(hit[0])
+                    break
+            else:
+                if inputs:
+                    self.pkg_inputs.append(inputs[0][1])
+
+        if not self.pkg_inputs and not self.core_inputs:
+            best = None
+            for tz in sorted(glob.glob(self.THERMAL + "/thermal_zone*")):
+                typ = read_text(tz + "/type", "")
+                rank = 0 if typ == "x86_pkg_temp" else 1 if "cpu" in typ.lower() else \
+                    2 if typ == "acpitz" else None
+                if rank is not None and (best is None or rank < best[0]):
+                    best = (rank, tz + "/temp")
+            if best:
+                self.pkg_inputs = [best[1]]
+                self.tag = " ACPI" if best[0] == 2 else ""
+
+        # Logical CPU -> (package, core), to put each core's temperature beside its bar
+        self.cpu_core = {}
+        if self.core_inputs:
+            for d in glob.glob(self.CPU_SYS + "/cpu[0-9]*"):
+                core = read_int(d + "/topology/core_id")
+                if core is not None:
+                    pkg = read_int(d + "/topology/physical_package_id", 0)
+                    self.cpu_core[int(os.path.basename(d)[3:])] = (pkg, core)
+
+        self.freq_paths = sorted(glob.glob(self.CPU_SYS + "/cpu[0-9]*/cpufreq/scaling_cur_freq"))
+        self.rapl = [d for d in sorted(glob.glob(self.RAPL + "/intel-rapl:*"))
+                     if re.fullmatch(r"intel-rapl:\d+", os.path.basename(d))
+                     and read_int(d + "/energy_uj") is not None]
+        self.rapl_prev = None
+
+    @staticmethod
+    def _temp(path):
+        v = read_int(path)
+        return v / 1000.0 if v is not None and 0 < v < 150000 else None
+
+    def sample(self):
+        res = {"Temp": None, "Tag": self.tag, "PowerW": None, "ClockMHz": None, "CoreTemps": {}}
+        core_t = {k: self._temp(p) for k, p in self.core_inputs.items()}
+        temps = [t for t in map(self._temp, self.pkg_inputs) if t is not None]
+        if not temps:   # old CPUs have per-core sensors but no package one
+            temps = [t for t in core_t.values() if t is not None]
+        if temps:
+            res["Temp"] = max(temps)
+        for cpu, key in self.cpu_core.items():
+            if core_t.get(key) is not None:
+                res["CoreTemps"][cpu] = core_t[key]
+
+        freqs = [v for v in map(read_int, self.freq_paths) if v]
+        if freqs:
+            res["ClockMHz"] = max(freqs) / 1000.0
+
+        if self.rapl:
+            now = time.monotonic()
+            cur = [read_int(d + "/energy_uj") for d in self.rapl]
+            if None in cur:
+                self.rapl_prev = None
+                return res
+            if self.rapl_prev and now > self.rapl_prev[0]:
+                joules = 0.0
+                for d, old, new in zip(self.rapl, self.rapl_prev[1], cur):
+                    delta = new - old
+                    if delta < 0:   # the counter wrapped
+                        delta += read_int(d + "/max_energy_range_uj") or 0
+                    joules += delta / 1e6
+                res["PowerW"] = joules / (now - self.rapl_prev[0])
+            self.rapl_prev = (now, cur)
+        return res
+
+
 # ── GPU ──────────────────────────────────────────────────────────────────────
 
 PCI_IDS_PATHS = ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids", "/usr/share/pci.ids")
@@ -246,12 +362,87 @@ def new_gpu_stats(name="No GPU detected"):
     }
 
 
+class LineStream:
+    """A long-running child whose stdout is read on a daemon thread, keeping the newest sample.
+
+    If shtop dies, the pipe closes and the child is killed by SIGPIPE on its next write,
+    so nothing is left running.
+    """
+
+    def __init__(self, argv, grouped=False):
+        self.grouped = grouped            # lines sharing a first token form one sample
+        self.lock = threading.Lock()
+        self.last_line = None
+        self.last_time = None
+        self.group, self.last_group, self.key = [], None, None
+        self.started = time.monotonic()
+        self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, universal_newlines=True, bufsize=1)
+        self.thread = threading.Thread(target=self._pump, daemon=True)
+        self.thread.start()
+
+    def _pump(self):
+        try:
+            for line in self.proc.stdout:
+                t = line.strip()
+                if not t or t[0] == "#":
+                    continue
+                with self.lock:
+                    self.last_time = time.monotonic()
+                    if not self.grouped:
+                        self.last_line = t
+                        continue
+                    key = t.split(None, 1)[0]
+                    if key != self.key:
+                        if self.key is not None:
+                            self.last_group = self.group
+                        self.group, self.key = [], key
+                    self.group.append(t)
+        except (OSError, ValueError):
+            pass
+
+    def age(self):
+        """Seconds since the last line arrived (infinite if none has)."""
+        with self.lock:
+            return time.monotonic() - self.last_time if self.last_time else float("inf")
+
+    def latest_line(self):
+        with self.lock:
+            return self.last_line
+
+    def latest_group(self):
+        # A sample's lines arrive in one burst, so a group that has been quiet for a
+        # moment is complete even though the next one hasn't started yet.
+        with self.lock:
+            if self.group and time.monotonic() - self.last_time > 0.15:
+                return list(self.group)
+            return self.last_group
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def close(self):
+        try:
+            self.proc.kill()
+            self.proc.wait(timeout=1)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 class NvidiaGpu:
     QUERY = ("name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,"
              "power.draw,power.limit,fan.speed,clocks.current.graphics,clocks.current.memory,pstate")
+    RESTART_SEC = 5.0
 
     def __init__(self, smi):
         self.smi = smi
+        self.refresh_ms = 1000
+        # nvidia-smi runs as two long-lived streams rather than being spawned twice per
+        # refresh. If a stream goes quiet, sample() falls back to a one-shot run.
+        self.query = None
+        self.query_ms = None
+        self.pmon = None
+        self.last_start = {"query": 0.0, "pmon": 0.0}
 
     def _run(self, *args):
         try:
@@ -261,10 +452,63 @@ class NvidiaGpu:
         except (OSError, subprocess.SubprocessError):
             return ""
 
+    def _spawn(self, which, argv, grouped):
+        """Start a stream, at most once per RESTART_SEC so a broken driver isn't hammered."""
+        now = time.monotonic()
+        if now - self.last_start[which] < self.RESTART_SEC:
+            return None
+        self.last_start[which] = now
+        try:
+            return LineStream([self.smi, *argv], grouped)
+        except OSError:
+            return None
+
+    def _ensure_streams(self):
+        ms = max(250, self.refresh_ms)
+        if self.query and self.query.alive() and self.query_ms != ms:
+            self.query.close()             # refresh rate changed: restart at the new rate
+            self.last_start["query"] = 0.0
+        if not self.query or not self.query.alive():
+            first = self.query is None
+            new = self._spawn("query", ["-i", "0", f"--query-gpu={self.QUERY}",
+                                        "--format=csv,noheader,nounits", "-lms", str(ms)], False)
+            if new:
+                if self.query:
+                    self.query.close()
+                self.query, self.query_ms = new, ms
+                if first:   # let the first sample arrive so the opening frame isn't blank
+                    for _ in range(20):
+                        if new.latest_line() or not new.alive():
+                            break
+                        time.sleep(0.05)
+                    if not new.alive():
+                        new.thread.join(0.3)   # it exited at once: collect the error it printed
+        if not self.pmon or not self.pmon.alive():
+            new = self._spawn("pmon", ["pmon", "-o", "T"], True)
+            if new:
+                if self.pmon:
+                    self.pmon.close()
+                self.pmon = new
+
+    def close(self):
+        for st in (self.query, self.pmon):
+            if st:
+                st.close()
+
     def sample(self, _pids):
         res = new_gpu_stats("NVIDIA GPU")
-        out = self._run(f"--query-gpu={self.QUERY}", "--format=csv,noheader,nounits")
-        lines = out.splitlines()
+        self._ensure_streams()
+        now = time.monotonic()
+        stale = max(3.0, self.refresh_ms / 1000.0 * 2.5)
+
+        q = self.query
+        line = q.latest_line() if q and q.age() < stale else None
+        if line is None and (q is None or now - q.started > 2):
+            out = self._run(f"--query-gpu={self.QUERY}", "--format=csv,noheader,nounits")
+            line = out.splitlines()[0] if out.strip() else None
+        if line is None and q:
+            line = q.latest_line()         # e.g. the NVML error it printed before exiting
+        lines = [line] if line else []
         parts = [p.strip() for p in lines[0].split(",")] if lines else []
         if len(parts) >= 12:
             res["Name"] = parts[0]
@@ -291,8 +535,16 @@ class NvidiaGpu:
             res["Name"] = f"NVIDIA: {err}"
             return res
 
-        for pl in self._run("pmon", "-c", "1").splitlines():
-            m = re.match(r"^\s*\d+\s+(\d+)\s+(\S+)\s+(\S+)", pl)
+        p = self.pmon
+        group = p.latest_group() if p and p.age() < 5 else None
+        if group is not None:
+            pat = r"^\S+\s+\d+\s+(\d+)\s+(\S+)\s+(\S+)"      # time, gpu, pid, type, sm
+        elif p is None or now - p.started > 3:
+            group, pat = self._run("pmon", "-c", "1").splitlines(), r"^\s*\d+\s+(\d+)\s+(\S+)\s+(\S+)"
+        else:
+            group, pat = [], ""
+        for pl in group:
+            m = re.match(pat, pl)
             if m:
                 res["GpuPids"][int(m.group(1))] = int(m.group(3)) if m.group(3).isdigit() else 0
         return res
@@ -536,6 +788,7 @@ def get_battery():
 def get_net_counters():
     rx = tx = prx = ptx = 0
     phys = False
+    phys_names, all_names = [], []
     with open("/proc/net/dev") as f:
         for line in f.readlines()[2:]:
             name, _, data = line.partition(":")
@@ -545,11 +798,17 @@ def get_net_counters():
                 continue
             r, t = int(parts[0]), int(parts[8])
             rx, tx = rx + r, tx + t
+            if r or t:
+                all_names.append(name)
             # Count only physical NICs so bridges/VPN tunnels don't double-count traffic
             if os.path.exists(f"/sys/class/net/{name}/device"):
                 phys = True
                 prx, ptx = prx + r, ptx + t
-    return (prx, ptx) if phys else (rx, tx)
+                if r or t:
+                    phys_names.append(name)
+    names = phys_names if phys else all_names
+    label = names[0] if len(names) == 1 else f"{len(names)} adapters" if names else ""
+    return (prx, ptx, label) if phys else (rx, tx, label)
 
 
 SKIP_FS = {"squashfs", "iso9660", "udf", "tmpfs", "devtmpfs", "overlay"}
@@ -615,10 +874,12 @@ def get_diskstats():
 # ── Processes ────────────────────────────────────────────────────────────────
 
 class Proc:
-    __slots__ = ("pid", "name", "cpu", "mem_mb", "mem_pct")
+    __slots__ = ("pid", "name", "cpu", "mem_mb", "mem_pct", "threads", "io")
 
-    def __init__(self, pid, name, cpu, mem_mb, mem_pct):
+    def __init__(self, pid, name, cpu, mem_mb, mem_pct, threads, io):
         self.pid, self.name, self.cpu, self.mem_mb, self.mem_pct = pid, name, cpu, mem_mb, mem_pct
+        self.threads = threads
+        self.io = io    # disk read + write bytes/sec; None when /proc/<pid>/io isn't readable
 
 
 class ProcSampler:
@@ -629,8 +890,34 @@ class ProcSampler:
         self.page = os.sysconf("SC_PAGE_SIZE")
         self.prev = {}
         self.names = {}
+        self.prev_io = {}
+        self.io_denied = set()
         self.prev_t = time.monotonic()
         self.sample(1, 1)
+
+    def _io_bytes(self, ent, key, denied):
+        """Bytes this process has really read from + written to storage, or None.
+
+        /proc/<pid>/io is readable only for your own processes without root. A refusal is
+        remembered so other users' processes don't cost a failed open on every refresh.
+        """
+        if key in self.io_denied:
+            denied.add(key)
+            return None
+        try:
+            with open(f"/proc/{ent}/io", "rb") as f:
+                data = f.read()
+        except OSError:
+            denied.add(key)
+            return None
+        total = 0
+        for line in data.splitlines():
+            if line.startswith((b"read_bytes:", b"write_bytes:")):
+                try:
+                    total += int(line.split()[1])
+                except (IndexError, ValueError):
+                    pass
+        return total
 
     @staticmethod
     def _full_name(ent, comm):
@@ -651,6 +938,7 @@ class ProcSampler:
         now = time.monotonic()
         elapsed = max(1e-3, now - self.prev_t)
         cur, names, procs, pids = {}, {}, [], []
+        cur_io, denied = {}, set()
         for ent in os.listdir("/proc"):
             if not ent.isdigit():
                 continue
@@ -666,6 +954,7 @@ class ProcSampler:
             try:
                 flags = int(fields[6])
                 ticks = int(fields[11]) + int(fields[12])
+                threads = int(fields[17])
                 start = fields[19]
                 rss = int(fields[21]) * self.page
             except (IndexError, ValueError):
@@ -679,8 +968,14 @@ class ProcSampler:
                 cpu = max(0.0, (ticks - self.prev[key]) / self.hz / elapsed / cores * 100.0)
             name = self.names.get(key) or self._full_name(ent, comm)
             names[key] = name
-            procs.append(Proc(int(ent), name, cpu, rss / MB, rss / mem_total * 100.0))
+            io = None
+            io_bytes = self._io_bytes(ent, key, denied)
+            if io_bytes is not None:
+                cur_io[key] = io_bytes
+                io = max(0.0, (io_bytes - self.prev_io.get(key, io_bytes)) / elapsed)
+            procs.append(Proc(int(ent), name, cpu, rss / MB, rss / mem_total * 100.0, threads, io))
         self.prev, self.names, self.prev_t = cur, names, now
+        self.prev_io, self.io_denied = cur_io, denied
         return procs, pids
 
 
@@ -700,14 +995,17 @@ class App:
         self.C = THEMES[theme_idx]
         self.sort_by = "CPU"
         self.show_per_core = True
-        self.sel = 0
-        self.sel_pid = None
+        self.sel = 0             # selected row, as an index into the whole sorted list
+        self.sel_pid = None      # set once you move the selection: the highlight follows it
+        self.scroll_top = 0      # index of the first visible row
+        self.rows = 10
+        self.sorted = []
+        self.kill_target = None  # (pid, name) awaiting confirmation
         self.status_msg = ""
         self.status_until = 0.0
         self.displayed = []
         self.filter_text = ""
         self.filter_mode = False
-        self.last_kill = None
         self.last_size = None
         self.resized = False
 
@@ -715,6 +1013,7 @@ class App:
         self.cpu_name = get_cpu_name()
         self.logical_cores = os.cpu_count() or 1
         self.cpu = CpuSampler()
+        self.sensors = CpuSensors()
         self.procs = ProcSampler()
         self.gpu = None
         try:
@@ -723,7 +1022,7 @@ class App:
             self.gpu = None
 
         self.cpu_hist, self.gpu_hist = [], []
-        self.prev_net = get_net_counters()
+        self.prev_net = get_net_counters()[:2]
         self.prev_net_t = time.monotonic()
         self.prev_disk = get_diskstats()
         self.prev_disk_t = time.monotonic()
@@ -811,9 +1110,24 @@ class App:
         C = self.C
         return f"{C.Border}│{C.Reset} {self.pad_ansi(content, inner)} {C.Border}│{C.Reset}"
 
+    @staticmethod
+    def join_fit(segments, width):
+        """Concatenate segments left to right, stopping before the first that would overflow."""
+        out, used = "", 0
+        for seg in segments:
+            n = visible_len(seg)
+            if used + n > width:
+                break
+            out, used = out + seg, used + n
+        return out
+
     def set_status(self, msg, secs):
         self.status_msg = msg
         self.status_until = time.monotonic() + secs
+
+    def close(self):
+        if self.gpu and hasattr(self.gpu, "close"):
+            self.gpu.close()
 
     # ── data collection ──
     def collect(self):
@@ -826,6 +1140,10 @@ class App:
         s["swap_total"] = mem.get("SwapTotal", 0)
         s["swap_used"] = s["swap_total"] - mem.get("SwapFree", 0)
         s["swap_pct"] = s["swap_used"] / s["swap_total"] * 100.0 if s["swap_total"] else 0.0
+        try:
+            s["sens"] = self.sensors.sample()
+        except OSError:
+            s["sens"] = {"Temp": None, "Tag": "", "PowerW": None, "ClockMHz": None, "CoreTemps": {}}
 
         procs, pids = self.procs.sample(s["ram_total"], self.logical_cores)
         s["procs"], s["proc_count"] = procs, len(pids)
@@ -833,6 +1151,7 @@ class App:
         gpu = new_gpu_stats()
         if self.gpu:
             try:
+                self.gpu.refresh_ms = self.refresh_ms
                 gpu = self.gpu.sample(pids)
             except Exception:
                 pass
@@ -846,9 +1165,9 @@ class App:
 
         now = time.monotonic()
         try:
-            rx, tx = get_net_counters()
+            rx, tx, s["net_label"] = get_net_counters()
         except OSError:
-            rx, tx = self.prev_net
+            (rx, tx), s["net_label"] = self.prev_net, ""
         dt = max(0.1, now - self.prev_net_t)
         s["rx_bps"] = max(0.0, (rx - self.prev_net[0]) / dt)
         s["tx_bps"] = max(0.0, (tx - self.prev_net[1]) / dt)
@@ -905,7 +1224,7 @@ class App:
         banner = f" │ {C.Orange}{self.status_msg}" if time.monotonic() < self.status_until else ""
         hdr_l = (f"{C.Title} shtop {C.Dim}│ {C.Cyan}{self.hostname} {C.Dim}│ Up: {C.Text}{up_str}"
                  f"{self.fmt_battery(s['battery'])} {C.Dim}│ {C.Yellow}{self.refresh_ms}ms{banner}")
-        hdr_r = (f"{C.Dim}[{C.Yellow}P{C.Dim}]Cores [{C.Yellow}T{C.Dim}]heme [{C.Yellow}C/M/G{C.Dim}]Sort "
+        hdr_r = (f"{C.Dim}[{C.Yellow}P{C.Dim}]Cores [{C.Yellow}T{C.Dim}]heme [{C.Yellow}C/M/G/I{C.Dim}]Sort "
                  f"[{C.Yellow}↑↓/K{C.Dim}]Kill [{C.Yellow}Q{C.Dim}]uit │ {C.Cyan}{clock} ")
         len_l, len_r = visible_len(hdr_l), visible_len(hdr_r)
         if len_l + len_r + 1 > win_w:   # narrow window: drop the key hints instead of wrapping
@@ -964,8 +1283,17 @@ class App:
             r4 = f"{C.Text}Power      {C.Dim}N/A{C.Reset}"
         lines.append(self.box_line(l4, lw, r4, rw))
 
-        l5 = (f"{C.Dim}Cores: {C.Text}{self.logical_cores} {C.Dim}([P] Per-Core)   "
-              f"Procs: {C.Text}{s['proc_count']}")
+        # Sensor readouts are appended only while they fit, so a narrow window drops them cleanly
+        sens = s["sens"]
+        segs = [f"{C.Dim}Cores: {C.Text}{self.logical_cores}", f"  {C.Dim}Procs: {C.Text}{s['proc_count']}"]
+        if sens["Temp"] is not None:
+            segs.append(f"  {C.Dim}Temp: {self.temp_color(sens['Temp'])}{sens['Temp']:.0f}°C"
+                        f"{C.Dim}{sens['Tag']}")
+        if sens["PowerW"] is not None:
+            segs.append(f"  {C.Dim}Pwr: {C.Yellow}{sens['PowerW']:.0f}W")
+        if sens["ClockMHz"] is not None:
+            segs.append(f"  {C.Dim}Clk: {C.Green}{sens['ClockMHz'] / 1000.0:.2f}GHz")
+        l5 = self.join_fit(segs, lw)
         parts = []
         if gpu["Temp"] is not None:
             parts.append(f"{C.Dim}Temp: {self.temp_color(gpu['Temp'])}{gpu['Temp']:.0f}°C")
@@ -988,12 +1316,19 @@ class App:
             extra += 1
             cols = 4
             cell_w = (full_w - (cols - 1) * 2) // cols
-            mini_w = max(4, cell_w - 11)
+            # Per-core temperature beside each bar, when the sensors have them and there's room
+            core_temps = sens["CoreTemps"]
+            show_core_t = bool(core_temps) and cell_w >= 19
+            mini_w = max(4, cell_w - (15 if show_core_t else 11))
             for i in range(0, len(cores), cols):
                 cells = []
                 for idx, cp in cores[i:i + cols]:
+                    core_t = ""
+                    if show_core_t:
+                        ct = core_temps.get(idx)
+                        core_t = f" {self.temp_color(ct)}{ct:2.0f}°" if ct is not None else "    "
                     cell = (f"{C.Dim}C{idx:<2}{C.Reset} {self.bar(cp, mini_w)} "
-                            f"{self.meter_color(cp)}{cp:4.0f}%{C.Reset}")
+                            f"{self.meter_color(cp)}{cp:4.0f}%{core_t}{C.Reset}")
                     cells.append(self.pad_ansi(cell, cell_w))
                 cells += [" " * cell_w] * (cols - len(cells))
                 lines.append(self.full_line("  ".join(cells), full_w))
@@ -1001,7 +1336,11 @@ class App:
 
         # ── ROW 2: DISKS (left) & NETWORK (right) ──
         dt_ = f"─{C.Title} Disks {C.Border}"
-        nt_ = f"─{C.Title} Network {C.Border}"
+        net_label = s["net_label"]
+        if len(net_label) > 24:
+            net_label = net_label[:23] + "…"
+        nt_ = (f"─{C.Title} Network {C.SubTitle}({net_label}) {C.Border}" if net_label
+               else f"─{C.Title} Network {C.Border}")
         if self.show_per_core and cores:
             mid = (f"{C.Border}├{dt_}{'─' * max(0, lw + 2 - visible_len(dt_))}┬{nt_}"
                    f"{'─' * max(0, rw + 3 - visible_len(nt_))}┤{C.Reset}")
@@ -1010,7 +1349,7 @@ class App:
                    f"{'─' * max(0, rw + 2 - visible_len(nt_))}┤{C.Reset}")
         lines.append(mid)
 
-        disks = s["disks"][:4]
+        disks = s["disks"][:6]
         disk_rows = max(2, len(disks))
         label_w = min(10, max([4] + [len(d["mnt"]) for d in disks]))
         dsk_lines = []
@@ -1040,23 +1379,6 @@ class App:
         lines.append(f"{C.Border}╰{'─' * (lw + 2)}╯╰{'─' * (rw + 2)}╯{C.Reset}")
 
         # ── ROW 3: PROCESSES (full width) ──
-        if self.filter_mode:
-            ftag = (f"Filter: {C.Yellow}{self.filter_text}{C.Text}_ {C.Dim}[Enter]Keep [Esc]Clear"
-                    f"{C.SubTitle}")
-        elif self.filter_text:
-            ftag = f"Filter: {C.Yellow}{self.filter_text} {C.Dim}[Esc]Clear{C.SubTitle}"
-        else:
-            ftag = f"[{C.Yellow}/{C.SubTitle}]Filter"
-        pt = (f"─{C.Title} Processes {C.SubTitle}(Sort: {C.Yellow}{self.sort_by}{C.SubTitle} │ {ftag} │ "
-              f"GPU Apps: {C.Green}{len(gpu_pids)}{C.SubTitle} │ Theme: {C.Cyan}{C.Name}{C.SubTitle}) "
-              f"{C.Border}")
-        lines.append(f"{C.Border}╭{pt}{'─' * max(0, full_w + 2 - visible_len(pt))}╮{C.Reset}")
-
-        name_w = max(18, full_w - 58)
-        hdr = (f"{'PID':>7}  {'PROCESS NAME':<{name_w}}  {'CPU %':>7}  {'MEM (MB)':>9}  "
-               f"{'MEM %':>6}  {'GPU STATUS':<16}")
-        lines.append(self.full_line(f"{C.HeaderBg}{hdr.ljust(full_w)}{C.Reset}", full_w))
-
         procs = s["procs"]
         if self.filter_text:
             ft = self.filter_text.lower()
@@ -1066,36 +1388,90 @@ class App:
         elif self.sort_by == "GPU":
             procs = sorted(procs, key=lambda p: (p.pid in gpu_pids, gpu_pids.get(p.pid, -1),
                                                  p.cpu, p.mem_mb), reverse=True)
+        elif self.sort_by == "IO":
+            procs = sorted(procs, key=lambda p: (p.io or 0.0, p.cpu, p.mem_mb), reverse=True)
         else:
             procs = sorted(procs, key=lambda p: (p.cpu, p.mem_mb), reverse=True)
+        self.sorted = procs
+        total = len(procs)
 
-        used = 15 + extra + (disk_rows - 2)
-        rows = max(3, win_h - used)
-        self.displayed = procs[:rows]
-        # Keep the highlight on the same process as the list re-sorts (safer kills)
+        # Once the selection has been moved it is tied to a PID, so the highlight follows
+        # that process as the list re-sorts. Untouched, it simply stays on the top row.
         if self.sel_pid is not None:
-            for i, p in enumerate(self.displayed):
-                if p.pid == self.sel_pid:
-                    self.sel = i
-                    break
-        if self.sel >= len(self.displayed):
-            self.sel = max(0, len(self.displayed) - 1)
+            found = next((i for i, p in enumerate(procs) if p.pid == self.sel_pid), -1)
+            if found >= 0:
+                self.sel = found
+            else:
+                # The process is gone: drop any pending kill, keep the highlight where it was
+                if self.kill_target:
+                    self.kill_target = None
+                    self.set_status("Process already exited", 3)
+                self.sel_pid = None
+        self.sel = max(0, min(self.sel, total - 1))
+        if self.sel_pid is None and self.sel > 0:
+            self.sel_pid = procs[self.sel].pid
+
+        # Scroll the window so the selected row stays visible
+        used = 15 + extra + (disk_rows - 2)
+        rows = self.rows = max(3, win_h - used)
+        if self.sel < self.scroll_top:
+            self.scroll_top = self.sel
+        if self.sel >= self.scroll_top + rows:
+            self.scroll_top = self.sel - rows + 1
+        self.scroll_top = max(0, min(self.scroll_top, total - rows))
+        self.displayed = procs[self.scroll_top:self.scroll_top + rows]
+        pos = f"{self.sel + 1}/{total}" if total else "0/0"
+
+        if self.filter_mode:
+            ftag = (f"Filter: {C.Yellow}{self.filter_text}{C.Text}_ {C.Dim}[Enter]Keep [Esc]Clear"
+                    f"{C.SubTitle}")
+        elif self.filter_text:
+            ftag = f"Filter: {C.Yellow}{self.filter_text} {C.Dim}[Esc]Clear{C.SubTitle}"
+        else:
+            ftag = f"[{C.Yellow}/{C.SubTitle}]Filter"
+        pt = (f"─{C.Title} Processes {C.SubTitle}(Sort: {C.Yellow}{self.sort_by}{C.SubTitle} │ "
+              f"{C.Text}{pos}{C.SubTitle} │ {ftag} │ "
+              f"GPU Apps: {C.Green}{len(gpu_pids)}{C.SubTitle} │ Theme: {C.Cyan}{C.Name}{C.SubTitle}) "
+              f"{C.Border}")
+        lines.append(f"{C.Border}╭{pt}{'─' * max(0, full_w + 2 - visible_len(pt))}╮{C.Reset}")
+
+        # Threads and disk I/O columns appear only when the window is wide enough for them
+        show_io = full_w >= 92
+        name_w = max(18, full_w - (74 if show_io else 58))
+        io_hdr = f"{'THR':>4}  {'DISK IO':>8}  " if show_io else ""
+        hdr = (f"{'PID':>7}  {'PROCESS NAME':<{name_w}}  {'CPU %':>7}  {'MEM (MB)':>9}  "
+               f"{'MEM %':>6}  {io_hdr}GPU STATUS")
+        lines.append(self.full_line(f"{C.HeaderBg}{hdr.ljust(full_w)}{C.Reset}", full_w))
 
         short = gpu["ShortName"]
+        kill_bg = _bg((150, 30, 40)) + _fg((255, 255, 255), True)
         for r, p in enumerate(self.displayed):
             name = p.name if len(p.name) <= name_w else p.name[:name_w - 1] + "…"
             on_gpu = p.pid in gpu_pids
             g_pct = gpu_pids.get(p.pid, 0)
             g_text = (f"● {short} ({g_pct}%)" if g_pct > 0 else f"● {short} (Active)") if on_gpu else "·"
-            if r == self.sel:
+            # "?" = not readable without root (another user's process)
+            io_text = ("?" if p.io is None else self.fmt_rate(p.io) if p.io >= 512 else "·").rjust(8)
+            if self.kill_target and p.pid == self.kill_target[0]:
+                # Confirmation prompt, drawn on the row that is about to be killed
+                ask = (f" Kill {self.kill_target[1]} (PID {p.pid})?   [Y] SIGTERM   [9] SIGKILL   "
+                       f"any other key cancels")
+                lines.append(self.full_line(f"{kill_bg}{ask[:full_w].ljust(full_w)}{C.Reset}", full_w))
+            elif self.scroll_top + r == self.sel:
+                io_plain = f"{p.threads:>4}  {io_text}  " if show_io else ""
                 plain = (f"{p.pid:>7}  {name:<{name_w}}  {p.cpu:6.1f}%  {p.mem_mb:8.1f}M  "
-                         f"{p.mem_pct:5.1f}%  {g_text:<19}")
+                         f"{p.mem_pct:5.1f}%  {io_plain}{g_text}")
                 lines.append(self.full_line(f"{C.SelBg}{plain.ljust(full_w)}{C.Reset}", full_w))
             else:
                 badge = f"{C.GpuTag}{g_text}{C.Reset}" if on_gpu else f"{C.Dim}·{C.Reset}"
+                io_cells = ""
+                if show_io:
+                    io_col = (C.Dim if not p.io or p.io < 512 else
+                              C.Yellow if p.io >= 10 * MB else C.Text)
+                    io_cells = f"{C.Dim}{p.threads:>4}  {io_col}{io_text}  "
                 row = (f"{C.Dim}{p.pid:>7}  {C.Text}{name.ljust(name_w)}  "
                        f"{self.meter_color(p.cpu * 2)}{p.cpu:6.1f}%  {C.Cyan}{p.mem_mb:8.1f}M  "
-                       f"{self.meter_color(p.mem_pct * 2)}{p.mem_pct:5.1f}%  {badge}")
+                       f"{self.meter_color(p.mem_pct * 2)}{p.mem_pct:5.1f}%  {io_cells}{badge}")
                 lines.append(self.full_line(row, full_w))
         if self.filter_text and not self.displayed:
             lines.append(self.full_line(f"{C.Dim}  No processes match '{self.filter_text}'", full_w))
@@ -1106,37 +1482,48 @@ class App:
         sys.stdout.flush()
 
     # ── input ──
-    def kill_selected(self):
-        if len(self.displayed) <= self.sel:
-            return
-        p = self.displayed[self.sel]
-        now = time.monotonic()
-        escalate = self.last_kill and self.last_kill[0] == p.pid and now - self.last_kill[1] < 3
-        sig = signal.SIGKILL if escalate else signal.SIGTERM
+    def request_kill(self):
+        """Kills are two-step: this only records the target (by PID, from the frame on screen)."""
+        if self.sel < len(self.sorted):
+            p = self.sorted[self.sel]
+            self.kill_target = (p.pid, p.name)
+            self.sel_pid = p.pid
+
+    def send_signal(self, pid, name, sig):
         try:
-            os.kill(p.pid, sig)
-            if escalate:
-                msg = f"Killed {p.name} (PID {p.pid}) with SIGKILL"
-                self.last_kill = None
+            os.kill(pid, sig)
+            if sig == signal.SIGKILL:
+                msg = f"Killed {name} (PID {pid}) with SIGKILL"
+                # Drop it from the cached list so it disappears now, not at the next sample
+                self.snap["procs"] = [p for p in self.snap["procs"] if p.pid != pid]
+                self.sel_pid = None
             else:
-                msg = f"Sent SIGTERM to {p.name} (PID {p.pid}) - K again to SIGKILL"
-                self.last_kill = (p.pid, now)
+                msg = f"Sent SIGTERM to {name} (PID {pid})"
         except PermissionError:
-            msg = f"Failed to kill PID {p.pid}: Permission denied"
+            msg = f"Failed to kill PID {pid}: Permission denied"
         except ProcessLookupError:
-            msg = f"PID {p.pid} has already exited"
+            msg = f"PID {pid} has already exited"
         self.set_status(msg, 3)
 
-    def move_sel(self, delta):
-        self.sel = max(0, self.sel + delta)
-        if self.displayed:
-            self.sel = min(self.sel, len(self.displayed) - 1)
-            self.sel_pid = self.displayed[self.sel].pid
+    def set_sel(self, idx):
+        if self.sorted:
+            self.sel = max(0, min(len(self.sorted) - 1, idx))
+            self.sel_pid = self.sorted[self.sel].pid
 
     def reset_sel(self):
-        self.sel, self.sel_pid = 0, None
+        self.sel, self.sel_pid, self.scroll_top = 0, None, 0
 
     def handle_key(self, k):
+        # A kill is waiting for confirmation: [Y] / [9] go through, any other key cancels
+        if self.kill_target:
+            (pid, name), self.kill_target = self.kill_target, None
+            if k in ("y", "Y"):
+                self.send_signal(pid, name, signal.SIGTERM)
+            elif k == "9":
+                self.send_signal(pid, name, signal.SIGKILL)
+            else:
+                self.set_status("Kill cancelled", 3)
+            return
         if self.filter_mode:
             if k == "ENTER":
                 self.filter_mode = False
@@ -1161,8 +1548,8 @@ class App:
                 self.reset_sel()
             else:
                 raise Quit()
-        elif k in ("c", "m", "g"):
-            self.sort_by = {"c": "CPU", "m": "MEM", "g": "GPU"}[k]
+        elif k in ("c", "m", "g", "i"):
+            self.sort_by = {"c": "CPU", "m": "MEM", "g": "GPU", "i": "IO"}[k]
             self.reset_sel()
         elif k == "p":
             self.show_per_core = not self.show_per_core
@@ -1171,11 +1558,19 @@ class App:
             self.C = THEMES[self.theme_idx]
             self.set_status(f"Theme: {self.C.Name}", 2)
         elif k == "UP":
-            self.move_sel(-1)
+            self.set_sel(self.sel - 1)
         elif k == "DOWN":
-            self.move_sel(1)
+            self.set_sel(self.sel + 1)
+        elif k == "PGUP":
+            self.set_sel(self.sel - self.rows)
+        elif k == "PGDN":
+            self.set_sel(self.sel + self.rows)
+        elif k == "HOME":
+            self.reset_sel()
+        elif k == "END":
+            self.set_sel(len(self.sorted) - 1)
         elif k in ("k", "DEL"):
-            self.kill_selected()
+            self.request_kill()
         elif k in ("+", "="):
             self.refresh_ms = max(250, self.refresh_ms - 250)
         elif k in ("-", "_"):
@@ -1183,7 +1578,10 @@ class App:
 
     @staticmethod
     def parse_keys(data):
-        seqs = {"\x1b[A": "UP", "\x1bOA": "UP", "\x1b[B": "DOWN", "\x1bOB": "DOWN", "\x1b[3~": "DEL"}
+        seqs = {"\x1b[A": "UP", "\x1bOA": "UP", "\x1b[B": "DOWN", "\x1bOB": "DOWN", "\x1b[3~": "DEL",
+                "\x1b[5~": "PGUP", "\x1b[6~": "PGDN",
+                "\x1b[H": "HOME", "\x1bOH": "HOME", "\x1b[1~": "HOME", "\x1b[7~": "HOME",
+                "\x1b[F": "END", "\x1bOF": "END", "\x1b[4~": "END", "\x1b[8~": "END"}
         keys, i = [], 0
         while i < len(data):
             c = data[i]
@@ -1279,6 +1677,7 @@ def main():
     except Exception:
         crash = traceback.format_exc()
     finally:
+        app.close()
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
         sys.stdout.buffer.write(f"{ESC}[?25h{ESC}[?1049l{ESC}[0m".encode())
         sys.stdout.flush()

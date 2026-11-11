@@ -20,9 +20,11 @@ It has the same layout, themes and keys as `ptop`. Under the hood it reads `/pro
 * **Intel / other DRM GPUs:** GPU % and core clock. VRAM shows as shared memory.
 * **Per-process GPU activity for AMD/Intel:** read from the kernel's DRM client stats in `/proc/<pid>/fdinfo`. You can see your own processes without root.
 * **CPU & RAM:** overall + **per-core grid** (`P`) from `/proc/stat`, RAM and swap from `/proc/meminfo`
-* **Disks & network:** capacity bars per real mount with live **Read/Write** throughput (`/proc/diskstats`), plus **Download/Upload** rates and totals for physical NICs (`/proc/net/dev`). Bridges, Docker veths and VPN tunnels aren't double-counted.
+* **CPU temperature, clock and power:** package temperature from the kernel's own sensors (`coretemp`, `k10temp`, `zenpower`, `cpu_thermal`), plus a **per-core temperature** beside each bar on Intel when the window is wide enough, and the current **clock** from cpufreq. Package **power** appears only where the RAPL energy counter is readable without root, which most distros don't allow. With no CPU sensor it falls back to a thermal zone, tagged `ACPI` when that zone is a generic one that may not be the CPU.
+* **Disks & network:** capacity bars per real mount (up to 6) with live **Read/Write** throughput (`/proc/diskstats`), plus **Download/Upload** rates and totals for physical NICs (`/proc/net/dev`). Bridges, Docker veths and VPN tunnels aren't double-counted.
 * **Battery (laptops):** charge % plus charging status or time remaining in the header, hidden on desktops
-* **Interactive process manager:** sort by CPU / memory / GPU, filter with `/`, select with `↑`/`↓`, and kill with `K`. The highlight stays on the process you picked while the list re-sorts, so you can't kill the wrong one.
+* **Interactive process manager:** sort by CPU / memory / GPU / disk I/O, filter with `/`, and scroll the whole list with `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`. The highlight stays on the process you picked while the list re-sorts. `K` asks before it kills: `Y` sends SIGTERM, `9` sends SIGKILL.
+* **Threads and disk I/O columns** on windows 96+ columns wide. Disk I/O is real storage reads + writes per second; it shows `?` for other users' processes, which can't be read without root.
 * **5 TrueColor themes:** Midnight, Cyberpunk, Matrix, Gruvbox, Nord
 * **Flicker-free:** alternate screen buffer and single-write frames. Redraws instantly on a key press or terminal resize.
 
@@ -31,7 +33,7 @@ It has the same layout, themes and keys as `ptop`. Under the hood it reads `/pro
 ## 🖥️ Interface Layout
 
 ```
- shtop │ thirteen600 │ Up: 2d 08h 55m │ 1000ms   [P]Cores [T]heme [C/M/G]Sort [↑↓/K]Kill [Q]uit │ 15:30:00
+ shtop │ thirteen600 │ Up: 2d 08h 55m │ 1000ms   [P]Cores [T]heme [C/M/G/I]Sort [↑↓/K]Kill [Q]uit │ 15:30:00
 ╭─ CPU (13th Gen Intel(R) Core(TM) i5-13600KF) ───────╮╭─ GPU (NVIDIA GeForce RTX 3080 [P5]) ────────────────╮
 │ CPU Total  ████████░░░░░░░░░░░░░░░░░░░░░  26.4%     ││ GPU Core   ██████████████░░░░░░░░░░░  61.0%         │
 │ History    ▁▂▃▄▃▂▁▂▃▅▆▄▃▂▁▂▃▄▃▂▁▂▃▄▅▄▃▂▁▂▃▄▃▂▁▂▃    ││ History    ▁▁▂▄▆▇▆▅▄▅▆▇█▇▆▅▄▅▆▆▅▄▃▄▅▆▅▄▅▆▅▄▃▄▅▆    │
@@ -80,10 +82,13 @@ shtop
 | **`C`** | Sort processes by **CPU %** |
 | **`M`** | Sort processes by **Memory Usage** |
 | **`G`** | Sort **Active GPU processes** to the top |
+| **`I`** | Sort processes by **disk I/O rate** |
 | **`P`** | Toggle **Per-Core CPU Utilization** grid |
 | **`T`** | Cycle **Color Themes** (*Midnight → Cyberpunk → Matrix → Gruvbox → Nord*) |
-| **`↑` / `↓`** | Move process selection highlight up / down |
-| **`K` / `Del`** | Send **SIGTERM** to the highlighted process. Press again within 3s to **SIGKILL** it |
+| **`↑` / `↓`** | Move process selection up / down (the list scrolls) |
+| **`PgUp` / `PgDn`** | Move the selection a page at a time |
+| **`Home` / `End`** | Jump to the top (and stop following a process) / bottom of the list |
+| **`K` / `Del`** | Kill the highlighted process, after asking: **`Y`** sends **SIGTERM**, **`9`** sends **SIGKILL**, any other key cancels |
 | **`/`** | Filter processes by name or PID (`Enter` keeps the filter, `Esc` clears it) |
 | **`+` / `-`** | Speed up / slow down the refresh interval (`250ms` – `5000ms`) |
 | **`Q` / `Esc` / `Ctrl+C`** | Quit and restore the terminal (`Esc` clears an active filter first) |
@@ -104,14 +109,15 @@ shtop -t gruvbox        # start with a different theme (alias: --theme)
 1. **CPU:** `/proc/stat` jiffy deltas, overall and per core. The CPU name comes from `/proc/cpuinfo`.
 2. **Memory:** `/proc/meminfo` (`MemAvailable`, `SwapTotal`/`SwapFree`).
 3. **GPU:**
-   * **NVIDIA:** `nvidia-smi --query-gpu` for the card and `nvidia-smi pmon` for processes.
+   * **NVIDIA:** `nvidia-smi --query-gpu` for the card and `nvidia-smi pmon` for processes. Both run as long-lived background streams instead of being spawned every refresh, with a one-shot fallback if a stream goes quiet.
    * **AMD:** `/sys/class/drm/cardN/device/` (`gpu_busy_percent`, `mem_info_vram_*`, `mem_busy_percent`) plus the card's `hwmon` sensors.
    * **Intel / others:** engine busy time summed from DRM `fdinfo`, with clocks from `gt_act_freq_mhz`.
    * The GPU name comes from the kernel or `pci.ids`.
-4. **Processes:** `/proc/<pid>/stat` for CPU ticks, RSS and kernel-thread flag. Kernel threads are hidden, and full names are recovered from `cmdline` when `comm` is truncated.
+4. **Processes:** `/proc/<pid>/stat` for CPU ticks, RSS, thread count and kernel-thread flag, and `/proc/<pid>/io` for disk I/O (your own processes only). Kernel threads are hidden, and full names are recovered from `cmdline` when `comm` is truncated.
 5. **Disks:** `/proc/mounts` + `statvfs` for capacity (like `df`), and `/proc/diskstats` for throughput. Loop, snap, read-only, tmpfs and `/boot` mounts are skipped.
 6. **Network:** `/proc/net/dev`, counting interfaces that have a physical `device` in sysfs.
 7. **Battery:** `/sys/class/power_supply/BAT*`.
+8. **CPU sensors:** `/sys/class/hwmon` for temperatures, `/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq` for the clock, and `/sys/class/powercap/intel-rapl:*/energy_uj` for power when readable.
 
 ---
 
