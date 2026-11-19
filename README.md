@@ -2,6 +2,7 @@
 NOTE: This is the Linux twin of [ptop](https://github.com/stavrostzagadouris/powershellTop), which Gemini Argon made for me. Claude ported it to Linux. Feel free to use it if you want.
 
 > 🪟 **On Windows?** Check out **[ptop](https://github.com/stavrostzagadouris/powershellTop)**, the original Windows version. It has the same look, themes and keys, in a single PowerShell script that needs no admin.
+> 🍎 **On macOS?** Check out **[atop / mactop](https://github.com/stavrostzagadouris/mactop)**, the macOS version for Apple Silicon & Intel Macs (also zero-root and zero-dependency).
 
 A fast, flicker-free, **zero-root** `btop`-style Terminal UI (TUI) system and GPU monitor for Linux, written as a single standalone Python 3 script with **no dependencies** beyond the standard library.
 
